@@ -1,0 +1,4750 @@
+import prisma from "../../loaders/prisma.js";
+import ApiError from "../utils/apiError.js";
+import timeRangeUtility from "../utils/timeRangeUtility.js";
+import productVisibilityUtility from "../utils/productVisibilityUtility.js";
+import stockManagementService from "./domain/stockManagementService.js";
+import stockValidationService from "./domain/stockValidationService.js";
+import { generateDocumentPDF, formatDate } from "../utils/pdfGenerator.js";
+import { enqueueCreateColis } from "./colisSyncService.js";
+import { PROVIDER_BY_NAME } from "../../providers/index.js";
+import { getPhoneSearchVariants } from "../utils/phoneUtils.js";
+import { createNotifications } from "./notificationService.js";
+import createSalesDocumentService from "./salesDocumentService.js";
+import {
+  resolveWalletForIncome,
+  creditWallet,
+} from "./caisseWalletHelper.js";
+
+const factureSvc = createSalesDocumentService("facture");
+
+const MODES_REQUIRING_BANK = ["CARTE_BANCAIRE", "VIREMENT"];
+const CASH_MODES = new Set(["ESPECE", "ESPECES"]);
+const VALID_PAYMENT_MODES = [
+  "ESPECE",
+  "CARTE_BANCAIRE",
+  "CHEQUE",
+  "EFFET",
+  "CARTE_FIDELITE",
+  "BON_ACHAT",
+  "REMISE",
+  "VIREMENT",
+];
+
+const PAYMENT_TOLERANCE = 0.009;
+
+/** Resolve catalog commission to a per-unit MAD amount for a given unit price. */
+const resolveUnitCommission = (commission, commissionType, unitPrice) => {
+  const raw = parseFloat(commission || 0) || 0;
+  if (raw <= 0) return 0;
+  if (commissionType === "PERCENTAGE") {
+    const price = parseFloat(unitPrice || 0) || 0;
+    return parseFloat(((price * raw) / 100).toFixed(2));
+  }
+  return parseFloat(raw.toFixed(2));
+};
+
+/** Commission applies only when the order is fully paid (and not cancelled). */
+const isOrderFullyPaid = (amountDue, amountPaid, commandStatus) => {
+  if (commandStatus === "ANNULE") return false;
+  if (commandStatus === "PAYE") return true;
+  const due = parseFloat(amountDue || 0);
+  const paid = parseFloat(amountPaid || 0);
+  return due > 0 && paid + PAYMENT_TOLERANCE >= due;
+};
+const getRoleName = (user) =>
+  String(user?.roleName || (typeof user?.role === "string" ? user.role : user?.role?.name) || "")
+    .trim()
+    .toLowerCase();
+
+const roleKey = (user) => getRoleName(user).replace(/[\s_-]+/g, "");
+
+const isSuperAdminUser = (user) =>
+  !!user?.isSuperAdmin || roleKey(user) === "superadmin";
+
+const isAdminLevelUser = (user) =>
+  isSuperAdminUser(user) || roleKey(user) === "societeadmin";
+
+const SUPER_ADMIN_ROLE_NAMES = ["Super_Admin", "SUPERADMIN"];
+const SOCIETE_ADMIN_ROLE_NAME = "Societe_Admin";
+
+/**
+ * Facture approver must be active, visible, and either Super Admin
+ * or Societe_Admin for the order's société.
+ */
+export const assertFactureApprover = async (approverId, societeId) => {
+  const id = parseInt(approverId, 10);
+  if (!id) {
+    throw new ApiError("factureApproverId is required", 400);
+  }
+
+  const approver = await prisma.user.findFirst({
+    where: { id, active: true, hidden: false },
+    select: {
+      id: true,
+      name: true,
+      email: true,
+      isSuperAdmin: true,
+      societeId: true,
+      role: { select: { name: true } },
+    },
+  });
+
+  if (!approver) {
+    throw new ApiError("Facture approver not found or inactive", 404);
+  }
+
+  const roleName = approver.role?.name;
+  const isSA =
+    approver.isSuperAdmin || SUPER_ADMIN_ROLE_NAMES.includes(roleName);
+  const isSocieteAdmin =
+    roleName === SOCIETE_ADMIN_ROLE_NAME &&
+    societeId != null &&
+    approver.societeId === societeId;
+
+  if (!isSA && !isSocieteAdmin) {
+    throw new ApiError(
+      "Facture approver must be a Super Admin or Societe Admin for this société",
+      400,
+    );
+  }
+
+  return approver;
+};
+
+const notifyFactureApprovalRequest = async (
+  db,
+  {
+    approverId,
+    orderId,
+    documentNumber,
+    clientName,
+    requestedByName,
+    ice,
+    raisonSocial,
+  },
+) => {
+  if (!approverId) return;
+  await createNotifications(db, {
+    userIds: [approverId],
+    type: "FACTURE_APPROVAL_REQUEST",
+    payload: {
+      orderId,
+      documentNumber: documentNumber ?? null,
+      clientName: clientName ?? null,
+      requestedByName: requestedByName ?? null,
+      ice: ice ?? null,
+      raisonSocial: raisonSocial ?? null,
+    },
+  });
+};
+
+const resolveLivreurDeliveryId = async (userId) => {
+  const delivery = await prisma.delivery.findUnique({
+    where: { userId },
+    select: { id: true },
+  });
+  return delivery?.id ?? -1;
+};
+
+const LIVREUR_STATUSES = ["PREPARE", "COLLECTE", "EN_ROUTE", "LIVRE"];
+const PREPARATEUR_DEFAULT_STATUSES = ["CONFIRME"];
+const PREPARATEUR_FILTERABLE_STATUSES = ["CONFIRME", "PREPARE"];
+
+/**
+ * Status filter for list endpoints. Role defaults win when the caller
+ * does not pass a status; an explicit status is kept only if allowed.
+ */
+const resolveRoleStatusFilter = (user, requestedStatus) => {
+  const requested = requestedStatus || undefined;
+  if (isAdminLevelUser(user)) return requested;
+
+  const role = getRoleName(user);
+  if (role === "livreur") {
+    if (requested && LIVREUR_STATUSES.includes(requested)) return requested;
+    return { in: LIVREUR_STATUSES };
+  }
+  if (role === "preparateur") {
+    if (requested && PREPARATEUR_FILTERABLE_STATUSES.includes(requested)) {
+      return requested;
+    }
+    return { in: PREPARATEUR_DEFAULT_STATUSES };
+  }
+  return requested;
+};
+
+/**
+ * Restrict Advanced BL queries to the caller's own orders.
+ * Super_Admin / Societe_Admin keep société (or global) visibility.
+ */
+const applyPersonalOrderScope = async (where, user) => {
+  if (isAdminLevelUser(user)) return where;
+  const role = getRoleName(user);
+
+  if (role === "livreur") {
+    where.livreurId = await resolveLivreurDeliveryId(user.id);
+    return where;
+  }
+  if (role === "preparateur") {
+    where.preparateurId = user.id;
+    return where;
+  }
+  if (role === "commercial") {
+    where.commercialId = user.id;
+    return where;
+  }
+
+  where.AND = [
+    ...(where.AND || []),
+    {
+      OR: [
+        { document: { createdBy: user.id } },
+        { commercialId: user.id },
+      ],
+    },
+  ];
+  return where;
+};
+
+const resolveVilleName = (ville) => {
+  if (ville == null || ville === "") return null;
+  if (typeof ville === "object") return ville.name ? String(ville.name).trim() || null : null;
+  const trimmed = String(ville).trim();
+  return trimmed || null;
+};
+
+const resolveAddress = (localisation) =>
+  typeof localisation === "string" && localisation.trim()
+    ? localisation.trim()
+    : null;
+
+const persistClientLocation = async (tx, clientId, { villeName, address }) => {
+  if (!clientId) return;
+  const data = {};
+  if (villeName !== undefined) {
+    data.city = villeName;
+    if (villeName) data.region = villeName;
+  }
+  if (address !== undefined) data.address = address;
+  if (Object.keys(data).length === 0) return;
+  await tx.client.update({
+    where: { id: clientId },
+    data,
+  });
+};
+
+async function creditOrderPayment(tx, {
+  societeId,
+  modeReglement,
+  banqueId,
+  amount,
+  userId,
+  clientId,
+  documentNumber,
+  documentDue,
+}) {
+  const creditAmount = parseFloat(amount);
+  if (!creditAmount || creditAmount <= 0) return;
+
+  if (MODES_REQUIRING_BANK.includes(modeReglement) && !banqueId) {
+    throw new ApiError(
+      `banqueId is required for ${modeReglement}. Select a bank to credit its wallet.`,
+      400,
+    );
+  }
+
+  let reglementId = null;
+  if (clientId && modeReglement) {
+    const reglement = await tx.reglementClient.create({
+      data: {
+        societeId,
+        date: new Date(),
+        clientId,
+        modeReglement,
+        documentNumbers: documentNumber ? [documentNumber] : null,
+        montantRegle: creditAmount,
+        montantBL: documentDue ?? 0,
+        solde: Math.max(0, parseFloat(((documentDue ?? 0) - creditAmount).toFixed(2))),
+        banqueId: banqueId ?? null,
+      },
+    });
+    reglementId = reglement.id;
+  }
+
+  const targetWallet = await resolveWalletForIncome(tx, {
+    societeId,
+    modeReglement,
+    banqueId,
+    userId,
+  });
+  if (targetWallet) {
+    await creditWallet(tx, {
+      caisse: targetWallet,
+      amount: creditAmount,
+      note: documentNumber
+        ? `Encaissement commande ${documentNumber} (${modeReglement})`
+        : `Encaissement commande (${modeReglement})`,
+      createdBy: userId ?? null,
+      reglementClientId: reglementId,
+    });
+  }
+
+  return { reglementId, wallet: targetWallet, modeReglement, amount: creditAmount };
+}
+
+async function requestCashRemittanceApproval(tx, {
+  societeId,
+  user,
+  amount,
+  documentNumber,
+}) {
+  if (!user?.id || isSuperAdminUser(user)) {
+    return null;
+  }
+
+  const source = await tx.caisse.findUnique({
+    where: { userId: user.id },
+  });
+  if (!source?.active) return null;
+
+  const destination = await tx.caisse.findFirst({
+    where: { societeId, caisseType: "CAISSE", active: true },
+    select: { id: true, name: true },
+  });
+  if (!destination) return null;
+
+  const transferAmount = parseFloat(amount);
+  if (!transferAmount || transferAmount <= 0) return null;
+
+  const created = await tx.caisseTransferRequest.create({
+    data: {
+      sourceCaisseId: source.id,
+      destinationCaisseId: destination.id,
+      amount: transferAmount,
+      note: documentNumber
+        ? `Encaissement espèces commande ${documentNumber}`
+        : "Encaissement espèces commande",
+      requiresSuperAdmin: true,
+      createdById: user.id,
+    },
+  });
+
+  const admins = await tx.user.findMany({
+    where: {
+      active: true,
+      OR: [
+        { isSuperAdmin: true },
+        { role: { name: { in: ["Super_Admin", "SUPERADMIN"] } } },
+      ],
+    },
+    select: { id: true },
+  });
+  const notifyIds = [...new Set(admins.map((a) => a.id))].filter(
+    (id) => id !== user.id,
+  );
+  if (notifyIds.length > 0) {
+    await createNotifications(tx, {
+      userIds: notifyIds,
+      type: "WALLET_TRANSFER_REQUEST",
+      payload: {
+        amount: transferAmount,
+        senderName: user.name,
+        destinationName: destination.name || "Caisse",
+        requiresSuperAdmin: true,
+        note: created.note,
+      },
+      transferRequestId: created.id,
+    });
+  }
+
+  return created.id;
+}
+
+const normalizePayments = (payments, remaining, fallback) => {
+  if (!Array.isArray(payments) || payments.length === 0) {
+    if (!fallback?.modeReglement) {
+      throw new ApiError(
+        "payments are required to mark the order as paid",
+        400,
+      );
+    }
+    return [
+      {
+        amount: remaining,
+        modeReglement: fallback.modeReglement,
+        banqueId: fallback.banqueId || null,
+      },
+    ];
+  }
+
+  const lines = payments.map((p, i) => {
+    const amount = parseFloat(p.amount);
+    const modeReglement = p.modeReglement;
+    if (!amount || amount <= 0) {
+      throw new ApiError(`Payment line ${i + 1}: amount must be > 0`, 400);
+    }
+    if (!VALID_PAYMENT_MODES.includes(modeReglement)) {
+      throw new ApiError(
+        `Payment line ${i + 1}: invalid modeReglement`,
+        400,
+      );
+    }
+    const banqueId = p.banqueId ? parseInt(p.banqueId) : null;
+    if (MODES_REQUIRING_BANK.includes(modeReglement) && !banqueId) {
+      throw new ApiError(
+        `Payment line ${i + 1}: banqueId is required for ${modeReglement}`,
+        400,
+      );
+    }
+    return { amount: parseFloat(amount.toFixed(2)), modeReglement, banqueId };
+  });
+
+  const sum = parseFloat(
+    lines.reduce((acc, l) => acc + l.amount, 0).toFixed(2),
+  );
+  if (Math.abs(sum - remaining) > 0.01) {
+    throw new ApiError(
+      `Payment total (${sum}) must equal remaining amount (${remaining})`,
+      400,
+    );
+  }
+  return lines;
+};
+
+const serializeHistoryPayments = (payments) => {
+  if (!Array.isArray(payments) || payments.length === 0) return null;
+  return JSON.stringify({
+    payments: payments.map((p) => ({
+      amount: parseFloat(p.amount),
+      modeReglement: p.modeReglement,
+      banqueId: p.banqueId || null,
+    })),
+  });
+};
+
+const parseHistoryPayments = (note) => {
+  if (!note || typeof note !== "string" || !note.trim().startsWith("{")) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(note);
+    if (!Array.isArray(parsed?.payments) || parsed.payments.length === 0) {
+      return null;
+    }
+    return parsed.payments.map((p) => ({
+      amount: parseFloat(p.amount),
+      modeReglement: p.modeReglement,
+      banqueId: p.banqueId || null,
+    }));
+  } catch {
+    return null;
+  }
+};
+
+const paymentsFromReglements = (reglements, documentNumber) =>
+  (reglements || [])
+    .filter((r) => {
+      const nums = Array.isArray(r.documentNumbers) ? r.documentNumbers : [];
+      return nums.includes(documentNumber);
+    })
+    .map((r) => ({
+      amount: parseFloat(r.montantRegle),
+      modeReglement: r.modeReglement,
+      banqueName: r.banque?.name || null,
+      createdAt: r.createdAt,
+    }));
+
+/* ============================================================
+   STATUS TRANSITION MAP
+   Defines allowed transitions per current status.
+   Stock impact happens ONLY at LIVRE.
+============================================================ */
+const ALLOWED_TRANSITIONS = {
+  EN_COURS: ["CONFIRME", "PREPARE", "ANNULE"],
+  CONFIRME: ["PREPARE", "ANNULE"],
+  PREPARE: ["COLLECTE", "ANNULE"], //stock change
+  COLLECTE: ["EN_ROUTE", "ANNULE"], //stock change
+  EN_ROUTE: ["LIVRE", "ANNULE"], //stock change
+  LIVRE: ["PAYE"],
+  // ANNULE and PAYE are terminal states.
+  // REPORTE is NOT a lifecycle status — handled via reportBL/resumeReportedBL.
+};
+
+// Role-based transition gate. SuperAdmin bypasses; roles not listed
+// here fall back to the RBAC permission check on the route.
+const ROLE_TRANSITIONS = {
+  Preparateur: new Set([
+    "EN_COURS->PREPARE",
+    "CONFIRME->PREPARE",
+  ]),
+  Livreur: new Set([
+    "PREPARE->COLLECTE",
+    "COLLECTE->EN_ROUTE",
+    "EN_ROUTE->LIVRE",
+    "LIVRE->PAYE",
+  ]),
+};
+
+/** Cancel (ANNULE) from these statuses is reserved to Super Admin / Societe_Admin. */
+const ADMIN_ONLY_CANCEL_FROM = ["PREPARE", "COLLECTE", "EN_ROUTE"];
+
+/* ============================================================
+   HELPER: Generate Document Number (shared with standard BL)
+   Format: BL-{YEAR}-{6-digit-sequence}
+============================================================ */
+const generateDocumentNumber = async (societeId, db = prisma) => {
+  const year = new Date().getFullYear();
+  const prefix = `BL-${year}`;
+
+  const lastDoc = await db.clientDocument.findFirst({
+    where: {
+      societeId,
+      documentNumber: { startsWith: prefix },
+      bonLivraison: { isNot: null },
+    },
+    orderBy: { documentNumber: "desc" },
+    select: { documentNumber: true },
+  });
+
+  let nextNumber = 1;
+  if (lastDoc) {
+    nextNumber = parseInt(lastDoc.documentNumber.split("-")[2]) + 1;
+  }
+
+  return `${prefix}-${String(nextNumber).padStart(6, "0")}`;
+};
+
+const findLinkedStandardBlIds = async (tx, advancedBlId) => {
+  const linked = await tx.bonLivraison.findMany({
+    where: { sourceOrderId: advancedBlId, type: "STANDARD" },
+    select: { id: true },
+  });
+  return linked.map((row) => row.id);
+};
+
+const syncLinkedStandardBlFinancials = async (tx, advancedBlId, data) => {
+  const ids = await findLinkedStandardBlIds(tx, advancedBlId);
+  if (ids.length === 0) return;
+  await tx.clientDocument.updateMany({
+    where: { id: { in: ids } },
+    data,
+  });
+};
+
+const cancelLinkedStandardBls = async (tx, advancedBlId) => {
+  await syncLinkedStandardBlFinancials(tx, advancedBlId, {
+    status: "CANCELLED",
+    amountPaid: 0,
+  });
+};
+
+const deleteLinkedStandardBls = async (tx, advancedBlId) => {
+  const linked = await tx.bonLivraison.findMany({
+    where: { sourceOrderId: advancedBlId, type: "STANDARD" },
+    select: { id: true },
+  });
+  for (const row of linked) {
+    await tx.bonLivraisonPackLine.deleteMany({ where: { bonLivraisonId: row.id } });
+    await tx.clientDocumentLine.deleteMany({ where: { documentId: row.id } });
+    await tx.stockTransaction.deleteMany({ where: { bonLivraisonId: row.id } });
+    await tx.bonLivraison.delete({ where: { id: row.id } });
+    await tx.clientDocument.delete({ where: { id: row.id } });
+  }
+};
+
+/* ============================================================
+   HELPER: Resolve article for a line
+============================================================ */
+const resolveLineArticle = async (tx, articleId, variantId) => {
+  if (articleId) {
+    return tx.article.findUnique({
+      where: { id: articleId },
+      include: {
+        family: { select: { id: true, name: true, TVA: true, remise: true } },
+      },
+    });
+  }
+  if (variantId) {
+    const variant = await tx.articleVariant.findUnique({
+      where: { id: variantId },
+      include: {
+        article: {
+          include: {
+            family: {
+              select: { id: true, name: true, TVA: true, remise: true },
+            },
+          },
+        },
+      },
+    });
+    return variant?.article ?? null;
+  }
+  return null;
+};
+
+/* ============================================================
+   HELPER: Validate line structure
+============================================================ */
+const validateLines = async (lines) => {
+  if (!Array.isArray(lines) || lines.length === 0) return;
+
+  const seenProducts = new Set();
+
+  lines.forEach((line, index) => {
+    if (!line.articleId && !line.variantId) {
+      throw new ApiError(
+        `Line ${index + 1}: Either articleId or variantId is required`,
+        400,
+      );
+    }
+    if (line.articleId && line.variantId) {
+      throw new ApiError(
+        `Line ${index + 1}: Provide either articleId OR variantId, not both`,
+        400,
+      );
+    }
+
+    const key = line.articleId
+      ? `article_${line.articleId}`
+      : `variant_${line.variantId}`;
+    if (seenProducts.has(key)) {
+      throw new ApiError(`Line ${index + 1}: Duplicate product`, 400);
+    }
+    seenProducts.add(key);
+
+    if (!line.quantity || parseFloat(line.quantity) <= 0) {
+      throw new ApiError(`Line ${index + 1}: Quantity must be > 0`, 400);
+    }
+    if (!line.unitPrice || parseFloat(line.unitPrice) <= 0) {
+      throw new ApiError(`Line ${index + 1}: Unit price must be > 0`, 400);
+    }
+    if (
+      line.priceField !== undefined &&
+      !["prixVente1", "prixVente2", "prixVente3"].includes(line.priceField)
+    ) {
+      throw new ApiError(
+        `Line ${index + 1}: priceField must be prixVente1, prixVente2, or prixVente3`,
+        400,
+      );
+    }
+  });
+
+  await productVisibilityUtility.validateBatchProductVisibility(
+    lines.map((l) => ({ articleId: l.articleId, variantId: l.variantId })),
+    "advanced bon livraison",
+  );
+};
+
+/* ============================================================
+   HELPER: Categorize by stock management
+============================================================ */
+const categorizeByStockManagement = async (lines) => {
+  const stockManaged = [];
+  const nonStockManaged = [];
+  for (const line of lines) {
+    const isManaged = await stockManagementService.isProductStockManaged(
+      line.articleId,
+      line.variantId,
+    );
+    (isManaged ? stockManaged : nonStockManaged).push(line);
+  }
+  return { stockManaged, nonStockManaged };
+};
+
+/* ============================================================
+   HELPER: Collect stock-impacting items for a BL
+   direction = "OUTBOUND" (PREPARE) | "INBOUND" (rollback on ANNULE)
+============================================================ */
+const collectStockItems = async (bl, user, direction) => {
+  const sign = direction === "OUTBOUND" ? -1 : 1;
+  const reasonPrefix =
+    direction === "OUTBOUND"
+      ? "Advanced BL preparation"
+      : "Advanced BL cancellation rollback";
+  const items = [];
+
+  for (const line of bl.document.lines) {
+    const isManaged = await stockManagementService.isProductStockManaged(
+      line.articleId,
+      line.variantId,
+    );
+    if (!isManaged) continue;
+
+    items.push({
+      depotId: bl.depotId,
+      articleId: line.articleId || null,
+      variantId: line.variantId || null,
+      quantityChange: sign * parseFloat(line.quantity),
+      transactionType: direction,
+      referenceId: bl.document.documentNumber,
+      reason: `${reasonPrefix}: ${bl.document.documentNumber}`,
+      userId: user.id,
+      bonLivraisonId: bl.id,
+    });
+  }
+
+  for (const packLine of bl.packLines) {
+    const packQty = parseFloat(packLine.quantity);
+    for (const comp of packLine.pack.components) {
+      const compArticle =
+        comp.article || (comp.variant ? { gereEnStock: true } : null);
+      if (!compArticle || !compArticle.gereEnStock) continue;
+
+      items.push({
+        depotId: bl.depotId,
+        articleId: comp.articleId || null,
+        variantId: comp.variantId || null,
+        quantityChange: sign * (parseFloat(comp.quantity) * packQty),
+        transactionType: direction,
+        referenceId: bl.document.documentNumber,
+        reason: `${reasonPrefix} — pack "${packLine.pack.name}" × ${packQty} in ${bl.document.documentNumber}`,
+        userId: user.id,
+        bonLivraisonId: bl.id,
+      });
+    }
+  }
+
+  return items;
+};
+
+/* ============================================================
+   FULL INCLUDE BLOCK (read operations)
+============================================================ */
+const FULL_ADVANCED_BL_INCLUDE = {
+  document: {
+    include: {
+      client: {
+        select: { id: true, name: true, type: true, phone: true, email: true },
+      },
+      lines: {
+        include: {
+          article: {
+            select: {
+              id: true,
+              barcode: true,
+              name: true,
+              gereEnStock: true,
+              prixVente1: true,
+              prixVente2: true,
+              prixVente3: true,
+              unitePrincipale: {
+                select: { id: true, name: true, symbol: true },
+              },
+              family: { select: { id: true, name: true, TVA: true } },
+            },
+          },
+          variant: {
+            select: {
+              id: true,
+              barcode: true,
+              name: true,
+              article: {
+                select: {
+                  id: true,
+                  name: true,
+                  gereEnStock: true,
+                  family: { select: { id: true, name: true, TVA: true } },
+                },
+              },
+            },
+          },
+        },
+        orderBy: { lineNumber: "asc" },
+      },
+      user: { select: { id: true, name: true, email: true } },
+    },
+  },
+  banque: { select: { id: true, name: true, RIB: true } },
+  depot: { select: { id: true, code: true, name: true } },
+  delivery: { select: { id: true, name: true, tel: true } },
+  agence: { select: { id: true, name: true, localisation: true } },
+  commercial: { select: { id: true, name: true, email: true } },
+  preparateur: { select: { id: true, name: true, email: true } },
+  reportedBy: { select: { id: true, name: true, email: true } },
+  factureApprover: { select: { id: true, name: true, email: true } },
+  factureApprovedBy: { select: { id: true, name: true, email: true } },
+  livreur: {
+    select: {
+      id: true,
+      name: true,
+      type: true,
+      tel: true,
+      user: { select: { id: true, email: true } },
+    },
+  },
+  packLines: {
+    include: {
+      pack: {
+        select: {
+          id: true,
+          barcode: true,
+          name: true,
+          prixVentePack: true,
+          components: {
+            include: {
+              article: { select: { id: true, name: true, gereEnStock: true } },
+              variant: { select: { id: true, name: true } },
+            },
+          },
+        },
+      },
+    },
+  },
+  stockTransactions: {
+    include: {
+      article: { select: { id: true, name: true } },
+      variant: { select: { id: true, name: true } },
+    },
+    orderBy: { createdAt: "asc" },
+  },
+  statusHistory: {
+    select: {
+      id: true,
+      status: true,
+      note: true,
+      createdAt: true,
+      user: { select: { id: true, name: true, email: true } },
+    },
+    orderBy: { createdAt: "asc" },
+  },
+};
+
+/* ============================================================
+   CREATE ADVANCED BON LIVRAISON
+
+   Creates a ClientDocument + BonLivraison with type = ADVANCED
+   and commandStatus = EN_COURS.
+
+   Stock is NOT deducted at creation — only at status PREPARE,
+   which also materializes a STANDARD BonLivraison linked to this order.
+============================================================ */
+export const create = async (data, user) => {
+  const {
+    clientName,
+    depotId,
+    deliveryId,
+    commandeId,
+    documentDate,
+    dateLivraison,
+    heureLivraison,
+    lines = [],
+    packLines = [],
+    montantPaid,
+    clientId,
+    saveAsClient,
+    updateClientLocation,
+    // Advanced fields
+    agenceId,
+    telephone,
+    whatsapp,
+    ville,
+    localisation,
+    withFacture,
+    raisonSocial,
+    ice,
+    siegeSocial,
+    nombreDeColis,
+    observation,
+    modeReglement,
+    modeReglementAvance,
+    banqueId,
+    commercialId,
+    preparateurId,
+    livreurId,
+    commandStatus,
+    providerConfigId,
+    factureApproverId,
+  } = data;
+
+  const requestedPaid = parseFloat(montantPaid || 0);
+  const creditMode =
+    requestedPaid > 0 ? (modeReglementAvance || modeReglement) : null;
+  if (
+    requestedPaid > 0 &&
+    MODES_REQUIRING_BANK.includes(creditMode) &&
+    !banqueId
+  ) {
+    throw new ApiError(
+      `banqueId is required for ${creditMode}. Select a bank to credit its wallet.`,
+      400,
+    );
+  }
+
+  // Initial status: EN_COURS (draft) or CONFIRME (skip approval step).
+  const ALLOWED_INITIAL_STATUSES = ["EN_COURS", "CONFIRME"];
+  const initialStatus = commandStatus || "EN_COURS";
+  if (!ALLOWED_INITIAL_STATUSES.includes(initialStatus)) {
+    throw new ApiError(
+      `commandStatus must be one of: ${ALLOWED_INITIAL_STATUSES.join(", ")}`,
+      400,
+    );
+  }
+
+  // Commercial role auto-assignment: a logged-in commercial owns the BL.
+  const effectiveCommercialId =
+    user.roleName === "Commercial" ? user.id : commercialId || null;
+
+  await timeRangeUtility.validateSystemHours(
+    new Date(),
+    "advanced bon livraison creation",
+  );
+
+  if (!clientName || !clientName.trim()) {
+    throw new ApiError("clientName is required", 400);
+  }
+
+  // Validate depot — depot drives the société for the document
+  if (!depotId) throw new ApiError("Depot is required", 400);
+  const depot = await prisma.depot.findFirst({
+    where: {
+      id: depotId,
+      ...(isSuperAdminUser(user) ? {} : { societeId: user.societeId }),
+    },
+    select: { id: true, societeId: true, active: true },
+  });
+  if (!depot) throw new ApiError("Depot not found or access denied", 404);
+  if (!depot.active) throw new ApiError("Cannot use inactive depot", 400);
+
+  const docSocieteId = depot.societeId;
+
+  // Validate agence if provided
+  if (agenceId) {
+    const agence = await prisma.agence.findFirst({
+      where: { id: agenceId, societeId: docSocieteId, active: true },
+    });
+    if (!agence) throw new ApiError("Agence not found or inactive", 404);
+  }
+
+  // Validate article lines
+  if (lines.length > 0) {
+    await validateLines(lines);
+    lines.forEach((line, i) => {
+      if (!line.priceField) {
+        throw new ApiError(`Line ${i + 1}: priceField is required`, 400);
+      }
+    });
+  }
+
+  // Validate pack lines
+  if (packLines.length > 0) {
+    for (let i = 0; i < packLines.length; i++) {
+      const pl = packLines[i];
+      if (!pl.id)
+        throw new ApiError(`Pack line ${i + 1}: id (packId) is required`, 400);
+      const pack = await prisma.pack.findFirst({
+        where: { id: pl.id, societeId: docSocieteId, active: true },
+      });
+      if (!pack) throw new ApiError(`Pack ${pl.id} not found or inactive`, 404);
+    }
+  }
+
+  if (lines.length === 0 && packLines.length === 0) {
+    throw new ApiError(
+      "At least one article line or pack line is required",
+      400,
+    );
+  }
+
+  const documentNumber = await generateDocumentNumber(docSocieteId);
+
+  // ── Step 1: resolve livreur type BEFORE the transaction ────────────────────
+  // Determines whether an external parcel must be created after the BL saves.
+  // ── Step 1: resolve livreur type BEFORE the transaction ────────────────────
+  // type=EXTERN + entityType=SOCIETE + known provider → company API integration
+  // type=EXTERN + entityType=PARTICULIER               → individual, local only
+  // type=INTERN                                        → internal, local only
+  let livreurIsExtern = false; // true only for EXTERN+SOCIETE with a known provider
+  let providerCode = null;
+  let externEntityType = null; // "SOCIETE" | "PARTICULIER" | null
+  if (livreurId) {
+    const livreur = await prisma.delivery.findUnique({
+      where: { id: livreurId },
+      select: { type: true, entityType: true, name: true },
+    });
+    if (livreur?.type === "EXTERN") {
+      externEntityType = livreur.entityType; // "SOCIETE" or "PARTICULIER"
+      if (livreur.entityType === "SOCIETE") {
+        providerCode = PROVIDER_BY_NAME[livreur.name?.toLowerCase()] ?? null;
+        livreurIsExtern = !!providerCode;
+      }
+      // PARTICULIER: externEntityType is set but livreurIsExtern stays false
+      // → no provider API, no queue, colisSync stays NOT_APPLICABLE
+    }
+  }
+
+  try {
+    const result = await prisma.$transaction(
+      async (tx) => {
+        // Process article lines — TTC pricing, no TVA/remise math
+        const linesWithFinancials = [];
+        let articlesCommission = 0;
+        for (let i = 0; i < lines.length; i++) {
+          const line = lines[i];
+          const article = await resolveLineArticle(
+            tx,
+            line.articleId,
+            line.variantId,
+          );
+          if (!article)
+            throw new ApiError(`Line ${i + 1}: Product not found`, 404);
+
+          const quantity = parseFloat(line.quantity);
+          const unitPriceTTC = parseFloat(line.unitPrice);
+          const totalTTC = parseFloat((quantity * unitPriceTTC).toFixed(2));
+          const unitCommission = resolveUnitCommission(
+            article.commission,
+            article.commissionType,
+            unitPriceTTC,
+          );
+          articlesCommission += unitCommission * quantity;
+
+          linesWithFinancials.push({
+            articleId: line.articleId || null,
+            variantId: line.variantId || null,
+            lineNumber: i + 1,
+            description: line.description || article.name,
+            quantity,
+            unitPrice: unitPriceTTC,
+            remise: 0,
+            commission: unitCommission,
+            totalHT: totalTTC,
+            tvaRate: 0,
+            totalTVA: 0,
+            totalTTC,
+            priceField: line.priceField,
+          });
+        }
+
+        // Pack line totals (prixVente × quantity), TTC + commission snapshot
+        let packTotalTTC = 0;
+        let packsCommission = 0;
+        const packLinesWithCommission = [];
+        for (const pl of packLines) {
+          const pack = await tx.pack.findFirst({
+            where: { id: pl.id, societeId: docSocieteId, active: true },
+            select: { id: true, commission: true, commissionType: true },
+          });
+          const qty = parseFloat(pl.quantity);
+          const prixVente = parseFloat(pl.prixVente);
+          const unitCommission = resolveUnitCommission(
+            pack?.commission,
+            pack?.commissionType,
+            prixVente,
+          );
+          packTotalTTC += prixVente * qty;
+          packsCommission += unitCommission * qty;
+          packLinesWithCommission.push({
+            bonLivraisonId: null, // filled below
+            packId: pl.id,
+            quantity: qty,
+            prixVente,
+            commission: unitCommission,
+          });
+        }
+
+        const articlesTotalTTC = linesWithFinancials.reduce(
+          (acc, l) => acc + l.totalTTC,
+          0,
+        );
+
+        const totalTTC = parseFloat(
+          (articlesTotalTTC + packTotalTTC).toFixed(2),
+        );
+        const totalHT = totalTTC;
+        const totalTVA = 0;
+        const totalCommission = parseFloat(
+          (articlesCommission + packsCommission).toFixed(2),
+        );
+
+        // Payment: clamp montantPaid to [0, totalTTC]
+        const paid = Math.max(
+          0,
+          Math.min(parseFloat(montantPaid || 0), totalTTC),
+        );
+        const amountPaid = parseFloat(paid.toFixed(2));
+        const amountDue = totalTTC;
+
+        const phone = typeof telephone === "string" ? telephone.trim() : null;
+        const villeName = resolveVilleName(ville);
+        const address = resolveAddress(localisation);
+        const wantsFacture = withFacture === true || withFacture === "true";
+        let resolvedFactureApproverId = null;
+        if (wantsFacture) {
+          if (!factureApproverId) {
+            throw new ApiError(
+              "factureApproverId is required when withFacture is true",
+              400,
+            );
+          }
+          await assertFactureApprover(factureApproverId, docSocieteId);
+          resolvedFactureApproverId = parseInt(factureApproverId, 10);
+        }
+        const iceValue =
+          wantsFacture && typeof ice === "string" && /^\d{15}$/.test(ice.trim())
+            ? ice.trim()
+            : null;
+        const factureRaison = wantsFacture && typeof raisonSocial === "string" && raisonSocial.trim()
+          ? raisonSocial.trim()
+          : null;
+        const factureSiege = wantsFacture && typeof siegeSocial === "string" && siegeSocial.trim()
+          ? siegeSocial.trim()
+          : null;
+
+        let linkedClientId = null;
+        let createdNewClient = false;
+
+        if (clientId) {
+          const existingById = await tx.client.findFirst({
+            where: { id: Number(clientId), societeId: docSocieteId },
+            select: { id: true },
+          });
+          if (!existingById) {
+            throw new ApiError("Client not found or access denied", 404);
+          }
+          linkedClientId = existingById.id;
+        } else if (saveAsClient && phone) {
+          const phoneVariants = getPhoneSearchVariants(phone);
+          const existingByPhone = await tx.client.findFirst({
+            where: {
+              societeId: docSocieteId,
+              phone: { in: phoneVariants },
+            },
+            select: { id: true },
+          });
+
+          if (existingByPhone) {
+            linkedClientId = existingByPhone.id;
+          } else {
+            let clientIce = null;
+            const clientType = wantsFacture ? "SOCIETE" : "PARTICULIER";
+            if (iceValue) {
+              const iceTaken = await tx.client.findFirst({
+                where: { societeId: docSocieteId, ice: iceValue },
+                select: { id: true },
+              });
+              if (!iceTaken) {
+                clientIce = iceValue;
+              }
+            }
+
+            const createdClient = await tx.client.create({
+              data: {
+                societeId: docSocieteId,
+                name: (wantsFacture && factureRaison) ? factureRaison : clientName.trim(),
+                phone,
+                address: (wantsFacture && factureSiege) ? factureSiege : address,
+                city: villeName,
+                region: villeName,
+                ice: clientIce,
+                type: clientType,
+              },
+              select: { id: true },
+            });
+            linkedClientId = createdClient.id;
+            createdNewClient = true;
+          }
+        }
+
+        if (linkedClientId && !createdNewClient && updateClientLocation !== false) {
+          await persistClientLocation(tx, linkedClientId, { villeName, address });
+        }
+
+        const clientDocument = await tx.clientDocument.create({
+          data: {
+            societeId: docSocieteId,
+            clientId: linkedClientId,
+            clientName: clientName.trim(),
+            documentNumber,
+            status: "DRAFT",
+            totalHT,
+            totalTVA,
+            totalTTC,
+            discount: 0,
+            amountPaid,
+            amountDue,
+            createdBy: user.id,
+          },
+        });
+
+        // Create BonLivraison with type = ADVANCED
+        await tx.bonLivraison.create({
+          data: {
+            id: clientDocument.id,
+            documentDate: documentDate ? new Date(documentDate) : new Date(),
+            // dateLivraison is NOT NULL in the schema — default to the document date
+            dateLivraison: dateLivraison
+              ? new Date(dateLivraison)
+              : documentDate
+                ? new Date(documentDate)
+                : new Date(),
+            depotId,
+            deliveryId: deliveryId || null,
+            commandeId: commandeId || null,
+            // Advanced fields
+            type: "ADVANCED",
+            commandStatus: initialStatus,
+            agenceId: agenceId || null,
+            heureLivraison: heureLivraison || null,
+            telephone: telephone || null,
+            whatsapp: whatsapp || null,
+            ville: villeName,
+            localisation: address,
+            withFacture: wantsFacture,
+            factureApproverId: resolvedFactureApproverId,
+            factureApprovalStatus: wantsFacture ? "PENDING" : "NONE",
+            raisonSocial: factureRaison,
+            ice: iceValue,
+            siegeSocial: factureSiege,
+            nombreDeColis: nombreDeColis || null,
+            observation: observation || null,
+            modeReglement: modeReglement || null,
+            banqueId: banqueId || null,
+            commercialId: effectiveCommercialId,
+            preparateurId: preparateurId || null,
+            livreurId: livreurId || null,
+            totalCommission,
+            // ── Step 2: stamp colis sync state + selected provider config ───
+            colisSync: livreurIsExtern ? "PENDING" : "NOT_APPLICABLE",
+            colisProvider: livreurIsExtern ? providerCode : null,
+            providerConfigId: livreurIsExtern
+              ? (providerConfigId ?? null)
+              : null,
+          },
+        });
+
+        // Create article lines
+        if (linesWithFinancials.length > 0) {
+          await tx.clientDocumentLine.createMany({
+            data: linesWithFinancials.map((l) => ({
+              ...l,
+              documentId: clientDocument.id,
+            })),
+          });
+        }
+
+        // Create pack lines
+        if (packLinesWithCommission.length > 0) {
+          await tx.bonLivraisonPackLine.createMany({
+            data: packLinesWithCommission.map((pl) => ({
+              bonLivraisonId: clientDocument.id,
+              packId: pl.packId,
+              quantity: pl.quantity,
+              prixVente: pl.prixVente,
+              commission: pl.commission,
+            })),
+          });
+        }
+
+        // Initial status entry — anchors the audit trail
+        await tx.bonLivraisonStatusHistory.create({
+          data: {
+            bonId: clientDocument.id,
+            status: initialStatus,
+            userId: user.id,
+            ...(amountPaid > 0
+              ? {
+                  note: serializeHistoryPayments([
+                    {
+                      amount: amountPaid,
+                      modeReglement: creditMode,
+                      banqueId,
+                    },
+                  ]),
+                }
+              : {}),
+          },
+        });
+
+        if (amountPaid > 0) {
+          await creditOrderPayment(tx, {
+            societeId: docSocieteId,
+            modeReglement: creditMode,
+            banqueId,
+            amount: amountPaid,
+            userId: user.id,
+            clientId: linkedClientId,
+            documentNumber,
+            documentDue: amountDue,
+          });
+        }
+
+        return tx.bonLivraison.findUnique({
+          where: { id: clientDocument.id },
+          include: FULL_ADVANCED_BL_INCLUDE,
+        });
+      },
+      { timeout: 30000 },
+    );
+
+    // ── Step 3: schedule colis creation AFTER transaction commits ─────────────
+    // Never call the Ameex API inside a Prisma transaction.
+    // Runs in-process (fire-and-forget) — no Redis / separate worker.
+    // TODO: map result.ville (free text) to a numeric Ameex city ID before production.
+    if (livreurIsExtern) {
+      enqueueCreateColis(
+        result.id,
+        providerCode,
+        providerConfigId ?? null,
+        {
+          receiver: clientName,
+          phone: telephone ?? null,
+          city: ville.id, // TODO: resolve numeric city ID from ville string before production
+          address: localisation ?? null,
+          cod: parseFloat(
+            (
+              parseFloat(result.document?.amountDue ?? 0) -
+              parseFloat(result.document?.amountPaid ?? 0)
+            ).toFixed(2),
+          ),
+          order_num: result.document?.documentNumber ?? null,
+          comment: observation ?? null,
+          product: null,
+        },
+      );
+    }
+
+    if (result.withFacture && result.factureApproverId) {
+      await notifyFactureApprovalRequest(prisma, {
+        approverId: result.factureApproverId,
+        orderId: result.id,
+        documentNumber: result.document?.documentNumber,
+        clientName: result.document?.clientName || clientName,
+        requestedByName: user.name || user.email || null,
+        ice: result.ice,
+        raisonSocial: result.raisonSocial,
+      });
+    }
+
+    return result;
+  } catch (error) {
+    if (error.code === "P2002") {
+      const target = error.meta?.target;
+      const targetStr = Array.isArray(target)
+        ? target.join(",")
+        : String(target || "");
+      if (targetStr.includes("phone")) {
+        throw new ApiError("Phone number already exists for a client", 409);
+      }
+      throw new ApiError("Duplicate document number", 409);
+    }
+    if (error.code === "P2003") throw new ApiError("Invalid reference", 400);
+    if (error instanceof ApiError) throw error;
+    throw new ApiError(
+      `Failed to create advanced bon livraison: ${error.message}`,
+      500,
+    );
+  }
+};
+
+/* ============================================================
+   TRANSITION STATUS
+
+   Enforces the workflow state machine.
+   Stock deduction (OUTBOUND) happens on transition to PREPARE.
+   The ADVANCED document is the bon de livraison — no STANDARD clone.
+   Pack components are exploded into individual stock transactions.
+============================================================ */
+export const transitionStatus = async (id, targetStatus, user, extra = {}) => {
+  await timeRangeUtility.validateSystemHours(
+    new Date(),
+    "advanced BL status transition",
+  );
+
+  const bl = await prisma.bonLivraison.findUnique({
+    where: { id },
+    include: {
+      document: {
+        include: {
+          lines: true,
+          client: { select: { id: true, name: true, societeId: true } },
+        },
+      },
+      preparateur: { select: { id: true, name: true } },
+      packLines: {
+        include: {
+          pack: {
+            include: {
+              components: {
+                include: {
+                  article: { select: { id: true, gereEnStock: true } },
+                  variant: { select: { id: true, articleId: true } },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+  });
+
+  if (!bl) throw new ApiError("Advanced bon livraison not found", 404);
+  if (bl.type !== "ADVANCED") {
+    throw new ApiError(
+      "This endpoint is only for ADVANCED bon livraisons",
+      400,
+    );
+  }
+  if (!isSuperAdminUser(user) && bl.document.societeId !== user.societeId) {
+    throw new ApiError("Access denied", 403);
+  }
+
+  if (bl.isSuspended) {
+    throw new ApiError(
+      "Cannot transition while BL is suspended. Resume it first.",
+      409,
+    );
+  }
+
+  const currentStatus = bl.commandStatus;
+  if (!currentStatus)
+    throw new ApiError("BonLivraison has no workflow status", 400);
+
+  const allowed = ALLOWED_TRANSITIONS[currentStatus];
+  if (!allowed || !allowed.includes(targetStatus)) {
+    throw new ApiError(
+      `Cannot transition from ${currentStatus} to ${targetStatus}. Allowed: ${(allowed || []).join(", ") || "none (terminal state)"}`,
+      400,
+    );
+  }
+
+  // Role-based gate (SuperAdmin bypasses)
+  if (!isSuperAdminUser(user)) {
+    const allowedForRole = ROLE_TRANSITIONS[user.roleName];
+    if (
+      allowedForRole &&
+      !allowedForRole.has(`${currentStatus}->${targetStatus}`)
+    ) {
+      throw new ApiError(
+        `Role ${user.roleName} cannot perform ${currentStatus} → ${targetStatus}`,
+        403,
+      );
+    }
+  }
+
+  // After preparation, only Super Admin / Societe_Admin may cancel.
+  if (
+    targetStatus === "ANNULE" &&
+    ADMIN_ONLY_CANCEL_FROM.includes(currentStatus) &&
+    !isAdminLevelUser(user)
+  ) {
+    throw new ApiError(
+      "Only société admins and super admins can cancel an order after it has been prepared",
+      403,
+    );
+  }
+
+  // Stock impact:
+  //   PREPARE                                 → OUTBOUND (apply)
+  //   ANNULE from {PREPARE, COLLECTE, EN_ROUTE} → INBOUND  (rollback)
+  const isStockApply = targetStatus === "PREPARE";
+  const isStockRollback =
+    targetStatus === "ANNULE" &&
+    ["PREPARE", "COLLECTE", "EN_ROUTE"].includes(currentStatus);
+
+  if ((isStockApply || isStockRollback) && !bl.depotId) {
+    throw new ApiError(
+      "Depot is required before preparing an order (stock movement)",
+      400,
+    );
+  }
+
+  let stockItems = [];
+  if (isStockApply || isStockRollback) {
+    stockItems = await collectStockItems(
+      bl,
+      user,
+      isStockApply ? "OUTBOUND" : "INBOUND",
+    );
+  }
+
+  if (isStockApply && stockItems.length > 0) {
+    await stockValidationService.validateBatchStockAvailabilityForBonLivraison(
+      stockItems.map((item) => ({
+        depotId: item.depotId,
+        articleId: item.articleId,
+        variantId: item.variantId,
+        quantity: Math.abs(item.quantityChange),
+      })),
+      `advanced BL ${bl.document.documentNumber}`,
+      bl.id,
+    );
+  }
+
+  let payLines = [];
+  if (targetStatus === "PAYE") {
+    const totalTTC = parseFloat(bl.document.totalTTC);
+    const previousPaid = parseFloat(bl.document.amountPaid || 0);
+    const remaining = parseFloat((totalTTC - previousPaid).toFixed(2));
+    if (remaining <= 0) {
+      payLines = [];
+    } else {
+      payLines = normalizePayments(extra.payments, remaining, {
+        modeReglement: bl.modeReglement,
+        banqueId: bl.banqueId,
+      });
+    }
+  }
+
+  const result = await prisma.$transaction(
+    async (tx) => {
+      if (isStockApply && stockItems.length > 0) {
+        // PREPARE → OUTBOUND: record stock transactions (needed for remove cleanup)
+        await stockManagementService.batchStockOperationsWithTx(tx, stockItems);
+      } else if (isStockRollback && stockItems.length > 0) {
+        // ANNULE rollback: directly reverse stock levels without creating new
+        // transaction records — deleteMany in remove() cleans the originals.
+        for (const item of stockItems) {
+          const where = item.articleId
+            ? { depotId: item.depotId, articleId: item.articleId }
+            : { depotId: item.depotId, variantId: item.variantId };
+          const stock = await tx.stockByDepot.findFirst({ where });
+          if (stock) {
+            await tx.stockByDepot.update({
+              where: { id: stock.id },
+              data: {
+                quantityAvailable:
+                  parseFloat(stock.quantityAvailable) +
+                  Math.abs(parseFloat(item.quantityChange)),
+              },
+            });
+          }
+        }
+      }
+
+      await tx.bonLivraison.update({
+        where: { id },
+        data: { commandStatus: targetStatus },
+      });
+
+      if (targetStatus === "ANNULE") {
+        await tx.clientDocument.update({
+          where: { id },
+          data: { status: "CANCELLED", amountPaid: 0 },
+        });
+        await cancelLinkedStandardBls(tx, id);
+
+        const preparateurId = bl.preparateurId || bl.preparateur?.id;
+        if (preparateurId && preparateurId !== user.id) {
+          await createNotifications(tx, {
+            userIds: [preparateurId],
+            type: "ORDER_CANCELLED",
+            payload: {
+              orderId: id,
+              documentNumber: bl.document?.documentNumber ?? null,
+              cancelledByName: user.name || user.email || null,
+              previousStatus: currentStatus,
+              clientName: bl.document?.client?.name ?? bl.document?.clientName ?? null,
+            },
+          });
+        }
+      } else if (targetStatus === "LIVRE") {
+        await tx.clientDocument.update({
+          where: { id },
+          data: { status: "COMPLETED" },
+        });
+        await syncLinkedStandardBlFinancials(tx, id, {
+          status: "COMPLETED",
+        });
+      } else if (targetStatus === "PAYE") {
+        const totalTTC = parseFloat(bl.document.totalTTC);
+        await tx.clientDocument.update({
+          where: { id },
+          data: {
+            amountPaid: totalTTC,
+            amountDue: totalTTC,
+            status: "PAID",
+          },
+        });
+        await syncLinkedStandardBlFinancials(tx, id, {
+          amountPaid: totalTTC,
+          amountDue: totalTTC,
+          totalTTC,
+          totalHT: bl.document.totalHT,
+          totalTVA: bl.document.totalTVA,
+          status: "PAID",
+        });
+        for (const line of payLines) {
+          await creditOrderPayment(tx, {
+            societeId: bl.document.societeId,
+            modeReglement: line.modeReglement,
+            banqueId: line.banqueId,
+            amount: line.amount,
+            userId: user.id,
+            clientId: bl.document.clientId,
+            documentNumber: bl.document.documentNumber,
+            documentDue: totalTTC,
+          });
+          if (CASH_MODES.has(line.modeReglement)) {
+            await requestCashRemittanceApproval(tx, {
+              societeId: bl.document.societeId,
+              user,
+              amount: line.amount,
+              documentNumber: bl.document.documentNumber,
+            });
+          }
+        }
+        if (payLines[0]?.modeReglement) {
+          await tx.bonLivraison.update({
+            where: { id },
+            data: {
+              modeReglement: payLines[0].modeReglement,
+              banqueId: payLines[0].banqueId,
+            },
+          });
+        }
+      }
+
+      await tx.bonLivraisonStatusHistory.create({
+        data: {
+          bonId: id,
+          status: targetStatus,
+          userId: user.id,
+          ...(targetStatus === "PAYE" && payLines.length
+            ? { note: serializeHistoryPayments(payLines) }
+            : {}),
+        },
+      });
+
+      return tx.bonLivraison.findUnique({
+        where: { id },
+        include: FULL_ADVANCED_BL_INCLUDE,
+      });
+    },
+    { timeout: 30000 },
+  );
+
+  return {
+    ...result,
+    transition: {
+      from: currentStatus,
+      to: targetStatus,
+      stockApplied: isStockApply,
+      stockRolledBack: isStockRollback,
+    },
+  };
+};
+
+/* ============================================================
+   REPORT BL (parallel operational condition)
+
+   Marks a BL as temporarily postponed without changing
+   commandStatus or moving stock. Records a REPORTE event
+   in the status history.
+============================================================ */
+const REPORTABLE_STATUSES = ["CONFIRME", "PREPARE", "COLLECTE", "EN_ROUTE"];
+
+export const reportBL = async (id, data, user) => {
+  const { reason, nextDeliveryDate } = data;
+
+  if (!reason || !reason.trim()) {
+    throw new ApiError("reason is required", 400);
+  }
+  if (!nextDeliveryDate) {
+    throw new ApiError("nextDeliveryDate is required", 400);
+  }
+
+  const bl = await prisma.bonLivraison.findUnique({
+    where: { id },
+    select: {
+      id: true,
+      type: true,
+      isReported: true,
+      commandStatus: true,
+      document: { select: { societeId: true } },
+    },
+  });
+
+  if (!bl) throw new ApiError("Advanced bon livraison not found", 404);
+  if (bl.type !== "ADVANCED") {
+    throw new ApiError(
+      "This endpoint is only for ADVANCED bon livraisons",
+      400,
+    );
+  }
+  if (!isSuperAdminUser(user) && bl.document.societeId !== user.societeId) {
+    throw new ApiError("Access denied", 403);
+  }
+
+  if (!REPORTABLE_STATUSES.includes(bl.commandStatus)) {
+    throw new ApiError(
+      `Cannot report a BL in status ${bl.commandStatus}. Allowed: ${REPORTABLE_STATUSES.join(", ")}`,
+      400,
+    );
+  }
+
+  return prisma.$transaction(async (tx) => {
+    await tx.bonLivraison.update({
+      where: { id },
+      data: {
+        isReported: true,
+        reportedAt: new Date(),
+        reportedById: user.id,
+        reportReason: reason.trim(),
+        nextDeliveryDate: new Date(nextDeliveryDate),
+      },
+    });
+
+    await tx.bonLivraisonStatusHistory.create({
+      data: {
+        bonId: id,
+        status: "REPORTE",
+        note: reason.trim(),
+        userId: user.id,
+      },
+    });
+
+    return tx.bonLivraison.findUnique({
+      where: { id },
+      include: FULL_ADVANCED_BL_INCLUDE,
+    });
+  });
+};
+
+/* ============================================================
+   RESUME REPORTED BL
+
+   Clears the reported flag and metadata. commandStatus is
+   untouched — the workflow continues from where it paused.
+   No history entry is written (resume is not a transition).
+============================================================ */
+export const resumeReportedBL = async (id, user) => {
+  const bl = await prisma.bonLivraison.findUnique({
+    where: { id },
+    select: {
+      id: true,
+      type: true,
+      isReported: true,
+      document: { select: { societeId: true } },
+    },
+  });
+
+  if (!bl) throw new ApiError("Advanced bon livraison not found", 404);
+  if (bl.type !== "ADVANCED") {
+    throw new ApiError(
+      "This endpoint is only for ADVANCED bon livraisons",
+      400,
+    );
+  }
+  if (!isSuperAdminUser(user) && bl.document.societeId !== user.societeId) {
+    throw new ApiError("Access denied", 403);
+  }
+  if (!bl.isReported) {
+    throw new ApiError("BL is not reported", 409);
+  }
+
+  return prisma.bonLivraison.update({
+    where: { id },
+    data: {
+      isReported: false,
+      reportedAt: null,
+      reportedById: null,
+      reportReason: null,
+      nextDeliveryDate: null,
+    },
+    include: FULL_ADVANCED_BL_INCLUDE,
+  });
+};
+
+/* ============================================================
+   SUSPENDED / RESUME BL
+
+   Toggles the isSuspended flag on a BL.
+   - isSuspended false → true : logs SUSPENDED in history.
+   - isSuspended true  → false: logs CONTINUED in history.
+
+   While isSuspended = true, transitionStatus is blocked (409).
+============================================================ */
+export const suspended = async (id, user) => {
+  const bl = await prisma.bonLivraison.findUnique({
+    where: { id },
+    select: {
+      id: true,
+      type: true,
+      isSuspended: true,
+      document: { select: { societeId: true } },
+    },
+  });
+
+  if (!bl) throw new ApiError("Advanced bon livraison not found", 404);
+  if (bl.type !== "ADVANCED") {
+    throw new ApiError("This is not an advanced bon livraison", 400);
+  }
+  if (!isSuperAdminUser(user) && bl.document.societeId !== user.societeId) {
+    throw new ApiError("Access denied", 403);
+  }
+
+  const newState = !bl.isSuspended;
+  const historyStatus = newState ? "SUSPENDED" : "CONTINUED";
+
+  return prisma.$transaction(async (tx) => {
+    await tx.bonLivraison.update({
+      where: { id },
+      data: { isSuspended: newState },
+    });
+
+    await tx.bonLivraisonStatusHistory.create({
+      data: { bonId: id, status: historyStatus, userId: user.id },
+    });
+
+    return tx.bonLivraison.findUnique({
+      where: { id },
+      include: FULL_ADVANCED_BL_INCLUDE,
+    });
+  });
+};
+
+/* ============================================================
+   GET ALL ADVANCED BON LIVRAISONS
+============================================================ */
+export const getAll = async (query, user) => {
+  const {
+    search,
+    livreurId,
+    commercialId,
+    preparateurId,
+    agenceId,
+    commandStatus,
+    page = 1,
+    limit = 50,
+  } = query;
+
+  // ── Role-based scope ───────────────────────────────────────────
+  // Admins      → société (or global) visibility
+  // Livreur     → BLs assigned to their Delivery.id, execution statuses
+  //               (PREPARE, COLLECTE, EN_ROUTE, LIVRE). A requested status
+  //               is applied when it belongs to that set.
+  // Preparateur → BLs assigned to themselves. Default = CONFIRME (ready
+  //               to prepare). PREPARE is allowed as an explicit filter.
+  // Commercial  → only BLs they own (commercialId = user.id).
+  // Other roles → orders they created or own as commercial.
+  const where = {
+    type: "ADVANCED",
+    document: isSuperAdminUser(user) ? undefined : { societeId: user.societeId },
+    ...(search && {
+      OR: [
+        { document: { clientName: { contains: search } } },
+        { ville: { contains: search } },
+      ],
+    }),
+    ...(agenceId && { agenceId: parseInt(agenceId) }),
+    ...(commercialId && { commercialId: parseInt(commercialId) }),
+    ...(preparateurId && { preparateurId: parseInt(preparateurId) }),
+    ...(livreurId && { livreurId: parseInt(livreurId) }),
+  };
+
+  if (!isAdminLevelUser(user)) {
+    await applyPersonalOrderScope(where, user);
+  }
+
+  const statusFilter = resolveRoleStatusFilter(user, commandStatus);
+  if (statusFilter) where.commandStatus = statusFilter;
+
+  const parsedPage = parseInt(page);
+  const parsedLimit = parseInt(limit);
+
+  const [total, rows] = await Promise.all([
+    prisma.bonLivraison.count({ where }),
+    prisma.bonLivraison.findMany({
+      where,
+      select: {
+        id: true,
+        ville: true,
+        localisation: true,
+        telephone: true,
+        whatsapp: true,
+        dateLivraison: true,
+        heureLivraison: true,
+        commandStatus: true,
+        isReported: true,
+        isSuspended: true,
+        nextDeliveryDate: true,
+        colisTrackingNumber: true,
+        nombreDeColis: true,
+        withFacture: true,
+        factureApproverId: true,
+        factureApprovalStatus: true,
+        ice: true,
+        raisonSocial: true,
+        siegeSocial: true,
+        modeReglement: true,
+        banqueId: true,
+        totalCommission: true,
+        document: {
+          select: {
+            clientName: true,
+            amountDue: true,
+            amountPaid: true,
+            documentNumber: true,
+            user: { select: { name: true } },
+            lines: {
+              select: {
+                description: true,
+                quantity: true,
+                unitPrice: true,
+                totalTTC: true,
+                article: { select: { name: true } },
+                variant: { select: { name: true } },
+              },
+              orderBy: { lineNumber: "asc" },
+            },
+          },
+        },
+        packLines: {
+          select: {
+            quantity: true,
+            prixVente: true,
+            pack: { select: { name: true } },
+          },
+        },
+        agence: { select: { name: true } },
+        livreur: { select: { id: true, name: true } },
+        preparateur: { select: { id: true, name: true } },
+      },
+      orderBy: { createdAt: "desc" },
+      skip: (parsedPage - 1) * parsedLimit,
+      take: parsedLimit,
+    }),
+  ]);
+
+  const fmt = (d) =>
+    d
+      ? new Date(d).toLocaleDateString("fr-FR", {
+          day: "2-digit",
+          month: "2-digit",
+          year: "numeric",
+        })
+      : null;
+
+  const data = rows.map((bl) => ({
+    id: bl.id,
+    clientName: bl.document?.clientName ?? null,
+    telephone: bl.telephone ?? null,
+    whatsapp: bl.whatsapp,
+    ville: bl.ville,
+    localisation: bl.localisation ?? null,
+    agenceName: bl.agence?.name ?? null,
+    dateLivraison: fmt(bl.dateLivraison),
+    heureLivraison: bl.heureLivraison,
+    amountDue: bl.document?.amountDue ? parseFloat(bl.document.amountDue) : 0,
+    amountPaid: bl.document?.amountPaid
+      ? parseFloat(bl.document.amountPaid)
+      : 0,
+    commandStatus: bl.commandStatus,
+    modeReglement: bl.modeReglement ?? null,
+    banqueId: bl.banqueId ?? null,
+    documentNumber: bl.document?.documentNumber ?? null,
+    createdByName: bl.document?.user?.name ?? null,
+    livreurId: bl.livreur?.id ?? null,
+    livreurName: bl.livreur?.name ?? null,
+    preparateurId: bl.preparateur?.id ?? null,
+    preparateurName: bl.preparateur?.name ?? null,
+    nombreDeColis: bl.nombreDeColis ?? 0,
+    isReported: bl.isReported,
+    isSuspended: bl.isSuspended,
+    colisTrackingNumber: bl.colisTrackingNumber,
+    nextDeliveryDate: fmt(bl.nextDeliveryDate),
+    isFacture: bl.withFacture === true || !!(bl.ice || bl.raisonSocial || bl.siegeSocial),
+    factureApproverId: bl.factureApproverId ?? null,
+    factureApprovalStatus: bl.factureApprovalStatus ?? "NONE",
+    totalCommission: isOrderFullyPaid(
+      bl.document?.amountDue,
+      bl.document?.amountPaid,
+      bl.commandStatus,
+    )
+      ? parseFloat(bl.totalCommission || 0)
+      : 0,
+    products: [
+      ...(bl.document?.lines ?? []).map((l) => ({
+        kind: "article",
+        name: l.article?.name || l.variant?.name || l.description || "—",
+        quantity: parseFloat(l.quantity),
+        unitPrice: parseFloat(l.unitPrice),
+        total: parseFloat(l.totalTTC),
+      })),
+      ...(bl.packLines ?? []).map((pl) => ({
+        kind: "pack",
+        name: pl.pack?.name ?? "—",
+        quantity: parseFloat(pl.quantity),
+        unitPrice: parseFloat(pl.prixVente),
+        total: parseFloat(
+          (parseFloat(pl.prixVente || 0) * parseFloat(pl.quantity || 0)).toFixed(2),
+        ),
+      })),
+    ],
+  }));
+
+  return {
+    data,
+    pagination: {
+      total,
+      page: parsedPage,
+      limit: parsedLimit,
+      totalPages: Math.ceil(total / parsedLimit),
+    },
+  };
+};
+
+/* ============================================================
+   GET BY ID
+============================================================ */
+export const getById = async (id, user) => {
+  const bl = await prisma.bonLivraison.findUnique({
+    where: { id },
+    include: {
+      ...FULL_ADVANCED_BL_INCLUDE,
+      document: {
+        include: {
+          ...FULL_ADVANCED_BL_INCLUDE.document.include,
+          societe: {
+            select: {
+              id: true,
+              raisonSocial: true,
+              address: true,
+              tel: true,
+              email: true,
+              ice: true,
+              logo: true,
+              phone: true,
+              documentHeaderConfig: true,
+            },
+          },
+        },
+      },
+    },
+  });
+
+  if (!bl) throw new ApiError("Advanced bon livraison not found", 404);
+  if (bl.type !== "ADVANCED") {
+    throw new ApiError("This is not an advanced bon livraison", 400);
+  }
+  if (!isSuperAdminUser(user) && bl.document.societe.id !== user.societeId) {
+    throw new ApiError("Access denied", 403);
+  }
+
+  return bl;
+};
+
+/* ============================================================
+   GET STEPPER TIMELINE
+
+   Builds the UI-ready lifecycle timeline for an Advanced BL.
+   Shape: [{ key, label, status, user, datetime }, ...]
+   - status: "confirmed" (past), "in_progress" (current), "pending" (future)
+   - REPORTE / ANNULE never appear here — the stepper shows only the
+     7 lifecycle steps. ANNULE keeps reached steps as "confirmed".
+============================================================ */
+const STEPPER_STEPS = [
+  { key: "EN_COURS", label: "En cours" },
+  { key: "CONFIRME", label: "Commande crée" },
+  { key: "PREPARE", label: "Commande préparée" },
+  { key: "COLLECTE", label: "Commande collectée" },
+  { key: "EN_ROUTE", label: "En route" },
+  { key: "LIVRE", label: "Livrée" },
+  { key: "PAYE", label: "Payée" },
+];
+
+const formatStepDateTime = (date) => {
+  if (!date) return "—";
+  const d = new Date(date);
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${pad(d.getDate())}-${pad(d.getMonth() + 1)}-${d.getFullYear()} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+};
+
+// Pure mapper — used by both /timeline and /details endpoints.
+const buildStepperTimeline = (commandStatus, statusHistory) => {
+  const firstByStatus = new Map();
+  for (const entry of statusHistory) {
+    if (!firstByStatus.has(entry.status)) {
+      firstByStatus.set(entry.status, entry);
+    }
+  }
+
+  return STEPPER_STEPS.reduce((acc, step) => {
+    const entry = firstByStatus.get(step.key);
+    const reached = !!entry;
+    const isCurrent = commandStatus === step.key;
+
+    // Skip EN_COURS if no history entry exists (no actor or timestamp recorded)
+    if (step.key === "EN_COURS" && !entry) return acc;
+
+    acc.push({
+      key: step.key,
+      label: step.label,
+      status: isCurrent ? "in_progress" : reached ? "confirmed" : "pending",
+      user: entry?.user?.name ?? "—",
+      datetime: formatStepDateTime(entry?.createdAt),
+    });
+
+    return acc;
+  }, []);
+};
+
+/* ============================================================
+   GET ADVANCED BL DETAILS
+
+   Single aggregation endpoint that returns the full UI payload:
+   { timeline, destinataire, blInfo, propos, history }.
+
+   Reuses the timeline mapper to guarantee consistency with
+   /:id/timeline. One Prisma round-trip serves the whole view.
+============================================================ */
+export const getAdvancedBLDetails = async (id, user) => {
+  const bl = await prisma.bonLivraison.findUnique({
+    where: { id },
+    select: {
+      id: true,
+      type: true,
+      commandStatus: true,
+      createdAt: true,
+      updatedAt: true,
+      dateLivraison: true,
+      heureLivraison: true,
+      telephone: true,
+      whatsapp: true,
+      ville: true,
+      localisation: true,
+      observation: true,
+      totalCommission: true,
+      withFacture: true,
+      factureApproverId: true,
+      factureApprovalStatus: true,
+      factureApprovedAt: true,
+      ice: true,
+      raisonSocial: true,
+      siegeSocial: true,
+      commercial: { select: { id: true, name: true } },
+      factureApprover: { select: { id: true, name: true } },
+      document: {
+        select: {
+          societeId: true,
+          clientId: true,
+          clientName: true,
+          documentNumber: true,
+          client: { select: { id: true, name: true, phone: true } },
+          amountDue: true,
+          amountPaid: true,
+          createdAt: true,
+          user: { select: { name: true } },
+          lines: {
+            select: {
+              lineNumber: true,
+              description: true,
+              quantity: true,
+              unitPrice: true,
+              commission: true,
+              totalTTC: true,
+              article: { select: { id: true, name: true, prixAchat: true } },
+              variant: {
+                select: {
+                  id: true,
+                  name: true,
+                  article: { select: { name: true, prixAchat: true } },
+                },
+              },
+            },
+            orderBy: { lineNumber: "asc" },
+          },
+        },
+      },
+      agence: { select: { name: true } },
+      preparateur: { select: { name: true } },
+      livreur: { select: { name: true } },
+      packLines: {
+        select: {
+          quantity: true,
+          prixVente: true,
+          commission: true,
+          pack: {
+            select: {
+              id: true,
+              name: true,
+              purchasePrice: true,
+              coutRevient: true,
+            },
+          },
+        },
+      },
+      statusHistory: {
+        select: {
+          status: true,
+          note: true,
+          createdAt: true,
+          user: { select: { name: true } },
+        },
+        orderBy: { createdAt: "asc" },
+      },
+    },
+  });
+
+  if (!bl) throw new ApiError("Advanced bon livraison not found", 404);
+  if (bl.type !== "ADVANCED") {
+    throw new ApiError("This is not an advanced bon livraison", 400);
+  }
+  if (!isSuperAdminUser(user) && bl.document.societeId !== user.societeId) {
+    throw new ApiError("Access denied", 403);
+  }
+
+  const timeline = buildStepperTimeline(bl.commandStatus, bl.statusHistory);
+
+  const destinataire = {
+    clientName: bl.document.clientName ?? null,
+    clientId: bl.document.clientId ?? null,
+    linkedClientName: bl.document.client?.name ?? null,
+    telephone: bl.telephone ?? null,
+    whatsapp: bl.whatsapp ?? null,
+    ville: bl.ville ?? null,
+    localisation: bl.localisation ?? null,
+    withFacture: bl.withFacture === true,
+    factureApproverId: bl.factureApproverId ?? null,
+    factureApprovalStatus: bl.factureApprovalStatus ?? "NONE",
+    factureApprovedAt: bl.factureApprovedAt ?? null,
+    factureApproverName: bl.factureApprover?.name ?? null,
+    ice: bl.ice ?? null,
+    raisonSocial: bl.raisonSocial ?? null,
+    siegeSocial: bl.siegeSocial ?? null,
+  };
+
+  const finances = mapOrderFinancials(bl);
+
+  const blInfo = {
+    montantDue: parseFloat(bl.document.amountDue || 0),
+    montantPaid: parseFloat(bl.document.amountPaid || 0),
+    totalCommission: finances.totalCommission,
+    boughtPrice: finances.boughtPrice,
+    netProfit: finances.netProfit,
+    commercialName: bl.commercial?.name ?? null,
+    commercialId: bl.commercial?.id ?? null,
+    products: finances.products,
+  };
+
+  const propos = {
+    dateLivraison: formatStepDateTime(bl.dateLivraison),
+    heureLivraison: bl.heureLivraison ?? "—",
+    agenceName: bl.agence?.name ?? "—",
+    livreurName: bl.livreur?.name ?? "—",
+    preparateurName: bl.preparateur?.name ?? "—",
+    observation: bl.observation ?? null,
+  };
+
+  // Build the audit history in chronological order.
+  const events = [];
+
+  events.push({
+    type: "creation",
+    user: bl.document.user?.name ?? "—",
+    datetime: formatStepDateTime(bl.createdAt),
+    _ts: bl.createdAt,
+  });
+
+  for (const entry of bl.statusHistory) {
+    let type;
+    let includeStatus = true;
+    if (entry.status === "ANNULE") type = "annulation";
+    else if (entry.status === "REPORTE") type = "reporte";
+    else if (entry.status === "UPDATE") {
+      type = "update";
+      includeStatus = false;
+    } else if (entry.status === "SUSPENDED") {
+      type = "suspended";
+      includeStatus = false;
+    } else if (entry.status === "CONTINUED") {
+      type = "continued";
+      includeStatus = false;
+    } else type = "transitionStatus";
+
+    const payments = parseHistoryPayments(entry.note);
+    events.push({
+      type,
+      ...(includeStatus && { status: entry.status }),
+      user: entry.user?.name ?? "—",
+      datetime: formatStepDateTime(entry.createdAt),
+      ...(payments
+        ? { payments }
+        : entry.note
+          ? { note: entry.note }
+          : {}),
+      _ts: entry.createdAt,
+    });
+  }
+
+  events.sort((a, b) => new Date(a._ts).getTime() - new Date(b._ts).getTime());
+
+  const creationEvent = events.find((e) => e.type === "creation");
+  const firstStatusEvent = events.find(
+    (e) =>
+      e.type === "transitionStatus" &&
+      (e.status === "EN_COURS" || e.status === "CONFIRME"),
+  );
+  if (creationEvent && firstStatusEvent?.payments && !creationEvent.payments) {
+    creationEvent.payments = firstStatusEvent.payments;
+    delete firstStatusEvent.payments;
+  }
+
+  const documentNumber = bl.document.documentNumber;
+  if (documentNumber && bl.document.societeId) {
+    const reglements = await prisma.reglementClient.findMany({
+      where: {
+        societeId: bl.document.societeId,
+        ...(bl.document.clientId ? { clientId: bl.document.clientId } : {}),
+      },
+      select: {
+        montantRegle: true,
+        modeReglement: true,
+        documentNumbers: true,
+        createdAt: true,
+        banque: { select: { name: true } },
+      },
+      orderBy: { createdAt: "asc" },
+    });
+    const related = paymentsFromReglements(reglements, documentNumber);
+    const used = new Set();
+    for (const event of events) {
+      if (event.payments?.length) continue;
+      const ts = new Date(event._ts).getTime();
+      if (Number.isNaN(ts)) continue;
+      const nearby = [];
+      related.forEach((p, i) => {
+        if (used.has(i)) return;
+        const delta = Math.abs(new Date(p.createdAt).getTime() - ts);
+        if (delta < 120000) {
+          used.add(i);
+          nearby.push(p);
+        }
+      });
+      if (!nearby.length) continue;
+      event.payments = nearby.map(({ createdAt, ...rest }) => rest);
+    }
+    const leftover = related.filter((_, i) => !used.has(i));
+    if (leftover.length) {
+      const payeEvent = events.find(
+        (e) => e.type === "transitionStatus" && e.status === "PAYE",
+      );
+      const target = payeEvent || creationEvent;
+      if (target && !target.payments?.length) {
+        target.payments = leftover.map(({ createdAt, ...rest }) => rest);
+      }
+    }
+  }
+
+  const bankIds = [
+    ...new Set(
+      events.flatMap((e) =>
+        (e.payments || []).map((p) => p.banqueId).filter(Boolean),
+      ),
+    ),
+  ];
+  if (bankIds.length) {
+    const banks = await prisma.banque.findMany({
+      where: { id: { in: bankIds } },
+      select: { id: true, name: true },
+    });
+    const bankNameById = Object.fromEntries(banks.map((b) => [b.id, b.name]));
+    for (const event of events) {
+      for (const payment of event.payments || []) {
+        if (payment.banqueId && bankNameById[payment.banqueId]) {
+          payment.banqueName = bankNameById[payment.banqueId];
+        }
+      }
+    }
+  }
+
+  const history = events.map(({ _ts, ...rest }) => rest);
+
+  return { timeline, destinataire, blInfo, propos, history };
+};
+
+/* ============================================================
+   UPDATE ADVANCED BON LIVRAISON
+
+   Editability rules:
+     - EN_COURS / CONFIRME → fully editable (lines, packs, totals included)
+     - PREPARE / COLLECTE / EN_ROUTE / LIVRE / PAYE → restricted edit
+       (only auxiliary, non-stock-impacting fields)
+     - ANNULE → frozen (no edits)
+
+   All prices are TTC — no TVA / no remise math.
+============================================================ */
+const FULL_EDIT_STATUSES = ["EN_COURS", "CONFIRME"];
+const FROZEN_STATUSES = ["ANNULE"];
+
+// Whitelist of fields editable when commandStatus has progressed past CONFIRME.
+// Anything stock-impacting (lines, packLines, depot, montantPaid, …) is excluded.
+const RESTRICTED_EDIT_FIELDS = new Set([
+  "clientName",
+  "telephone",
+  "whatsapp",
+  "dateLivraison",
+  "heureLivraison",
+  "ville",
+  "localisation",
+  "withFacture",
+  "factureApproverId",
+  "raisonSocial",
+  "ice",
+  "siegeSocial",
+  "nombreDeColis",
+  "observation",
+  "modeReglement",
+  "banqueId",
+  "agenceId",
+  "preparateurId",
+  "livreurId",
+  "commercialId",
+]);
+
+export const update = async (id, data, user) => {
+  const existing = await prisma.bonLivraison.findUnique({
+    where: { id },
+    select: {
+      id: true,
+      type: true,
+      commandStatus: true,
+      banqueId: true,
+      modeReglement: true,
+      withFacture: true,
+      factureApproverId: true,
+      factureApprovalStatus: true,
+      ice: true,
+      raisonSocial: true,
+      document: {
+        select: {
+          societeId: true,
+          clientId: true,
+          clientName: true,
+          documentNumber: true,
+        },
+      },
+    },
+  });
+
+  if (!existing) throw new ApiError("Advanced bon livraison not found", 404);
+  if (existing.type !== "ADVANCED") {
+    throw new ApiError("This is not an advanced bon livraison", 400);
+  }
+  if (!isSuperAdminUser(user) && existing.document.societeId !== user.societeId) {
+    throw new ApiError("Access denied", 403);
+  }
+  if (FROZEN_STATUSES.includes(existing.commandStatus)) {
+    throw new ApiError(
+      `Cannot update a BL with status ${existing.commandStatus}.`,
+      400,
+    );
+  }
+
+  const isFullEdit = FULL_EDIT_STATUSES.includes(existing.commandStatus);
+
+  // In restricted mode, reject any field outside the whitelist before doing work.
+  if (!isFullEdit) {
+    const disallowed = Object.keys(data || {}).filter(
+      (k) => !RESTRICTED_EDIT_FIELDS.has(k),
+    );
+    if (disallowed.length > 0) {
+      throw new ApiError(
+        `Cannot edit ${disallowed.join(", ")} when status is ${existing.commandStatus}. Allowed: ${[...RESTRICTED_EDIT_FIELDS].join(", ")}.`,
+        400,
+      );
+    }
+  }
+
+  await timeRangeUtility.validateSystemHours(new Date(), "advanced BL update");
+
+  const {
+    clientName,
+    depotId,
+    deliveryId,
+    commandeId,
+    documentDate,
+    dateLivraison,
+    heureLivraison,
+    lines,
+    packLines,
+    montantPaid,
+    agenceId,
+    telephone,
+    whatsapp,
+    ville,
+    localisation,
+    withFacture,
+    factureApproverId,
+    raisonSocial,
+    ice,
+    siegeSocial,
+    nombreDeColis,
+    observation,
+    modeReglement,
+    banqueId,
+    commercialId,
+    preparateurId,
+    livreurId,
+  } = data;
+
+  const wantsFacture =
+    withFacture === undefined
+      ? undefined
+      : withFacture === true || withFacture === "true";
+
+  // Resolve facture approval fields before the transaction
+  let factureApprovalPatch = {};
+  let shouldNotifyFactureApprover = false;
+  let notifyApproverId = null;
+
+  if (wantsFacture === false) {
+    factureApprovalPatch = {
+      factureApproverId: null,
+      factureApprovalStatus: "NONE",
+      factureApprovedAt: null,
+      factureApprovedById: null,
+    };
+  } else if (
+    wantsFacture === true &&
+    existing.factureApprovalStatus !== "ACCEPTED"
+  ) {
+    const nextApproverId =
+      factureApproverId !== undefined
+        ? factureApproverId
+          ? parseInt(factureApproverId, 10)
+          : null
+        : existing.factureApproverId;
+
+    if (!nextApproverId) {
+      throw new ApiError(
+        "factureApproverId is required when withFacture is true",
+        400,
+      );
+    }
+
+    await assertFactureApprover(nextApproverId, existing.document.societeId);
+
+    const enabling = !existing.withFacture;
+    const approverChanged = nextApproverId !== existing.factureApproverId;
+    const needsApprovalReset =
+      enabling ||
+      approverChanged ||
+      existing.factureApprovalStatus === "NONE" ||
+      existing.factureApprovalStatus === "DECLINED";
+
+    if (needsApprovalReset) {
+      factureApprovalPatch = {
+        factureApproverId: nextApproverId,
+        factureApprovalStatus: "PENDING",
+        factureApprovedAt: null,
+        factureApprovedById: null,
+      };
+      const samePendingApprover =
+        existing.factureApprovalStatus === "PENDING" && !approverChanged;
+      shouldNotifyFactureApprover = !samePendingApprover;
+      notifyApproverId = nextApproverId;
+    } else if (factureApproverId !== undefined) {
+      factureApprovalPatch = { factureApproverId: nextApproverId };
+    }
+  } else if (
+    factureApproverId !== undefined &&
+    existing.factureApprovalStatus !== "ACCEPTED" &&
+    (wantsFacture === true || existing.withFacture)
+  ) {
+    const nextApproverId = factureApproverId
+      ? parseInt(factureApproverId, 10)
+      : null;
+    if (!nextApproverId) {
+      throw new ApiError(
+        "factureApproverId is required when withFacture is true",
+        400,
+      );
+    }
+    await assertFactureApprover(nextApproverId, existing.document.societeId);
+    const approverChanged = nextApproverId !== existing.factureApproverId;
+    factureApprovalPatch = {
+      factureApproverId: nextApproverId,
+      factureApprovalStatus: "PENDING",
+      factureApprovedAt: null,
+      factureApprovedById: null,
+    };
+    shouldNotifyFactureApprover =
+      !(existing.factureApprovalStatus === "PENDING" && !approverChanged);
+    notifyApproverId = nextApproverId;
+  }
+
+  const villeName = ville !== undefined ? resolveVilleName(ville) : undefined;
+  const address = localisation !== undefined ? resolveAddress(localisation) : undefined;
+
+  const resolvedMode = modeReglement !== undefined ? modeReglement : undefined;
+  const resolvedBanque = banqueId !== undefined ? banqueId : undefined;
+  if (
+    resolvedMode !== undefined &&
+    MODES_REQUIRING_BANK.includes(resolvedMode) &&
+    !(resolvedBanque || existing.banqueId)
+  ) {
+    throw new ApiError(
+      `banqueId is required for ${resolvedMode}. Select a bank to credit its wallet.`,
+      400,
+    );
+  }
+
+  const effectiveCommercialId =
+    commercialId !== undefined
+      ? user.roleName === "Commercial"
+        ? user.id
+        : commercialId || null
+      : undefined;
+
+  // Pre-validate lines outside the transaction (cheap, fail fast)
+  if (isFullEdit && Array.isArray(lines)) {
+    if (
+      lines.length === 0 &&
+      (!Array.isArray(packLines) || packLines.length === 0)
+    ) {
+      throw new ApiError("At least one article or pack line is required", 400);
+    }
+    await validateLines(lines);
+    lines.forEach((line, i) => {
+      if (!line.priceField) {
+        throw new ApiError(`Line ${i + 1}: priceField is required`, 400);
+      }
+    });
+  }
+
+  if (isFullEdit && Array.isArray(packLines)) {
+    for (let i = 0; i < packLines.length; i++) {
+      const pl = packLines[i];
+      if (!pl.id)
+        throw new ApiError(`Pack line ${i + 1}: id (packId) is required`, 400);
+      const pack = await prisma.pack.findFirst({
+        where: {
+          id: pl.id,
+          societeId: existing.document.societeId,
+          active: true,
+        },
+        select: { id: true },
+      });
+      if (!pack) throw new ApiError(`Pack ${pl.id} not found or inactive`, 404);
+    }
+  }
+
+  const result = await prisma.$transaction(
+    async (tx) => {
+      if (clientName !== undefined) {
+        const trimmed = typeof clientName === "string" ? clientName.trim() : "";
+        if (!trimmed) {
+          throw new ApiError("clientName cannot be empty", 400);
+        }
+        await tx.clientDocument.update({
+          where: { id },
+          data: { clientName: trimmed },
+        });
+      }
+
+      await tx.bonLivraison.update({
+        where: { id },
+        data: {
+          ...(isFullEdit &&
+            documentDate && { documentDate: new Date(documentDate) }),
+          // dateLivraison is NOT NULL in the schema — ignore explicit null/empty
+          ...(dateLivraison && { dateLivraison: new Date(dateLivraison) }),
+          ...(isFullEdit && depotId && { depotId }),
+          ...(isFullEdit &&
+            deliveryId !== undefined && {
+              deliveryId: deliveryId || null,
+            }),
+          ...(isFullEdit &&
+            commandeId !== undefined && {
+              commandeId: commandeId || null,
+            }),
+          ...(agenceId !== undefined && { agenceId: agenceId || null }),
+          ...(heureLivraison !== undefined && { heureLivraison }),
+          ...(telephone !== undefined && { telephone }),
+          ...(whatsapp !== undefined && { whatsapp }),
+          ...(villeName !== undefined && { ville: villeName }),
+          ...(address !== undefined && { localisation: address }),
+          ...(wantsFacture !== undefined && { withFacture: wantsFacture }),
+          ...factureApprovalPatch,
+          ...(wantsFacture === false
+            ? { raisonSocial: null, ice: null, siegeSocial: null }
+            : {
+                ...(raisonSocial !== undefined && { raisonSocial }),
+                ...(ice !== undefined && { ice }),
+                ...(siegeSocial !== undefined && { siegeSocial }),
+              }),
+          ...(nombreDeColis !== undefined && { nombreDeColis }),
+          ...(observation !== undefined && { observation }),
+          ...(modeReglement !== undefined && {
+            modeReglement: modeReglement || null,
+          }),
+          ...(banqueId !== undefined && { banqueId: banqueId || null }),
+          ...(effectiveCommercialId !== undefined && {
+            commercialId: effectiveCommercialId,
+          }),
+          ...(preparateurId !== undefined && {
+            preparateurId: preparateurId || null,
+          }),
+          ...(livreurId !== undefined && { livreurId: livreurId || null }),
+        },
+      });
+
+      if (
+        existing.document.clientId &&
+        (villeName !== undefined || address !== undefined)
+      ) {
+        await persistClientLocation(tx, existing.document.clientId, {
+          villeName: villeName ?? undefined,
+          address: address ?? undefined,
+        });
+      }
+
+      // Lines / packs / totals are only touched in fully-editable statuses.
+      if (!isFullEdit) {
+        await tx.bonLivraisonStatusHistory.create({
+          data: { bonId: id, status: "UPDATE", userId: user.id },
+        });
+
+        return tx.bonLivraison.findUnique({
+          where: { id },
+          include: FULL_ADVANCED_BL_INCLUDE,
+        });
+      }
+
+      // Replace article lines if provided — TTC pricing, no TVA/remise
+      if (Array.isArray(lines)) {
+        await tx.clientDocumentLine.deleteMany({ where: { documentId: id } });
+
+        const linesWithFinancials = [];
+        for (let i = 0; i < lines.length; i++) {
+          const line = lines[i];
+          const article = await resolveLineArticle(
+            tx,
+            line.articleId,
+            line.variantId,
+          );
+          if (!article)
+            throw new ApiError(`Line ${i + 1}: Product not found`, 404);
+
+          const quantity = parseFloat(line.quantity);
+          const unitPriceTTC = parseFloat(line.unitPrice);
+          const totalTTC = parseFloat((quantity * unitPriceTTC).toFixed(2));
+          const unitCommission = resolveUnitCommission(
+            article.commission,
+            article.commissionType,
+            unitPriceTTC,
+          );
+
+          linesWithFinancials.push({
+            documentId: id,
+            articleId: line.articleId || null,
+            variantId: line.variantId || null,
+            lineNumber: i + 1,
+            description: line.description || article.name,
+            quantity,
+            unitPrice: unitPriceTTC,
+            remise: 0,
+            commission: unitCommission,
+            totalHT: totalTTC,
+            tvaRate: 0,
+            totalTVA: 0,
+            totalTTC,
+            priceField: line.priceField,
+          });
+        }
+
+        if (linesWithFinancials.length > 0) {
+          await tx.clientDocumentLine.createMany({ data: linesWithFinancials });
+        }
+      }
+
+      // Replace pack lines if provided
+      if (Array.isArray(packLines)) {
+        await tx.bonLivraisonPackLine.deleteMany({
+          where: { bonLivraisonId: id },
+        });
+        if (packLines.length > 0) {
+          const packRows = [];
+          for (const pl of packLines) {
+            const pack = await tx.pack.findFirst({
+              where: {
+                id: pl.id,
+                societeId: existing.document.societeId,
+                active: true,
+              },
+              select: { id: true, commission: true, commissionType: true },
+            });
+            const prixVente = parseFloat(pl.prixVente);
+            packRows.push({
+              bonLivraisonId: id,
+              packId: pl.id,
+              quantity: parseFloat(pl.quantity),
+              prixVente,
+              commission: resolveUnitCommission(
+                pack?.commission,
+                pack?.commissionType,
+                prixVente,
+              ),
+            });
+          }
+          await tx.bonLivraisonPackLine.createMany({ data: packRows });
+        }
+      }
+
+      // Recalculate document totals from current rows (TTC only)
+      const [updatedLines, updatedPackLines, currentDoc] = await Promise.all([
+        tx.clientDocumentLine.findMany({
+          where: { documentId: id },
+          select: { totalTTC: true, quantity: true, commission: true },
+        }),
+        tx.bonLivraisonPackLine.findMany({
+          where: { bonLivraisonId: id },
+          select: { quantity: true, prixVente: true, commission: true },
+        }),
+        tx.clientDocument.findUnique({
+          where: { id },
+          select: { amountPaid: true, clientId: true, documentNumber: true },
+        }),
+      ]);
+
+      const articlesTotalTTC = updatedLines.reduce(
+        (acc, l) => acc + parseFloat(l.totalTTC || 0),
+        0,
+      );
+      const packTotalTTC = updatedPackLines.reduce(
+        (acc, pl) =>
+          acc + parseFloat(pl.prixVente || 0) * parseFloat(pl.quantity || 0),
+        0,
+      );
+      const totalCommission = parseFloat(
+        (
+          updatedLines.reduce(
+            (acc, l) =>
+              acc + parseFloat(l.commission || 0) * parseFloat(l.quantity || 0),
+            0,
+          ) +
+          updatedPackLines.reduce(
+            (acc, pl) =>
+              acc +
+              parseFloat(pl.commission || 0) * parseFloat(pl.quantity || 0),
+            0,
+          )
+        ).toFixed(2),
+      );
+
+      const totalTTC = parseFloat((articlesTotalTTC + packTotalTTC).toFixed(2));
+
+      const previousPaid = parseFloat(currentDoc?.amountPaid || 0);
+      const proposedPaid =
+        montantPaid !== undefined ? parseFloat(montantPaid) : previousPaid;
+      const amountPaid = parseFloat(
+        Math.max(0, Math.min(proposedPaid, totalTTC)).toFixed(2),
+      );
+      const amountDue = parseFloat(totalTTC.toFixed(2));
+
+      await tx.clientDocument.update({
+        where: { id },
+        data: {
+          totalHT: totalTTC,
+          totalTVA: 0,
+          totalTTC,
+          amountPaid,
+          amountDue,
+        },
+      });
+
+      await tx.bonLivraison.update({
+        where: { id },
+        data: { totalCommission },
+      });
+
+      await syncLinkedStandardBlFinancials(tx, id, {
+        amountPaid,
+        amountDue,
+        totalTTC,
+        totalHT: totalTTC,
+        totalTVA: 0,
+      });
+
+      const paymentDelta = parseFloat((amountPaid - previousPaid).toFixed(2));
+      if (paymentDelta > 0) {
+        await creditOrderPayment(tx, {
+          societeId: existing.document.societeId,
+          modeReglement: modeReglement ?? existing.modeReglement,
+          banqueId: banqueId !== undefined ? banqueId : existing.banqueId,
+          amount: paymentDelta,
+          userId: user.id,
+          clientId: currentDoc?.clientId ?? existing.document.clientId,
+          documentNumber: currentDoc?.documentNumber ?? existing.document.documentNumber,
+          documentDue: amountDue,
+        });
+      }
+
+      // Audit trail: who edited the BL and when. Not a lifecycle transition.
+      await tx.bonLivraisonStatusHistory.create({
+        data: { bonId: id, status: "UPDATE", userId: user.id },
+      });
+
+      return tx.bonLivraison.findUnique({
+        where: { id },
+        include: FULL_ADVANCED_BL_INCLUDE,
+      });
+    },
+    { timeout: 30000 },
+  );
+
+  if (shouldNotifyFactureApprover && notifyApproverId) {
+    await notifyFactureApprovalRequest(prisma, {
+      approverId: notifyApproverId,
+      orderId: result.id,
+      documentNumber: result.document?.documentNumber,
+      clientName: result.document?.clientName,
+      requestedByName: user.name || user.email || null,
+      ice: result.ice,
+      raisonSocial: result.raisonSocial,
+    });
+  }
+
+  return result;
+};
+
+/* ============================================================
+   UPDATE ORDER COMMISSION
+   Allows adjusting totalCommission independently of line items
+   (used by commercial stats).
+============================================================ */
+export const updateCommission = async (id, totalCommission, user) => {
+  const amount = parseFloat(totalCommission);
+  if (!Number.isFinite(amount) || amount < 0) {
+    throw new ApiError("totalCommission must be a number >= 0", 400);
+  }
+
+  const existing = await prisma.bonLivraison.findUnique({
+    where: { id },
+    select: {
+      id: true,
+      type: true,
+      commandStatus: true,
+      document: { select: { societeId: true } },
+    },
+  });
+
+  if (!existing) throw new ApiError("Advanced bon livraison not found", 404);
+  if (existing.type !== "ADVANCED") {
+    throw new ApiError("This is not an advanced bon livraison", 400);
+  }
+  if (!isSuperAdminUser(user) && existing.document.societeId !== user.societeId) {
+    throw new ApiError("Access denied", 403);
+  }
+  if (FROZEN_STATUSES.includes(existing.commandStatus)) {
+    throw new ApiError(
+      `Cannot update commission when status is ${existing.commandStatus}.`,
+      400,
+    );
+  }
+
+  const rounded = roundMoney(amount);
+
+  const updated = await prisma.$transaction(async (tx) => {
+    await tx.bonLivraison.update({
+      where: { id },
+      data: { totalCommission: rounded },
+    });
+    await tx.bonLivraisonStatusHistory.create({
+      data: { bonId: id, status: "UPDATE", userId: user.id },
+    });
+    return tx.bonLivraison.findUnique({
+      where: { id },
+      select: {
+        id: true,
+        totalCommission: true,
+        commandStatus: true,
+      },
+    });
+  });
+
+  return {
+    id: updated.id,
+    totalCommission: roundMoney(parseFloat(updated.totalCommission || 0)),
+    commandStatus: updated.commandStatus,
+  };
+};
+
+/* ============================================================
+   DELETE ADVANCED BON LIVRAISON
+   Only allowed when commandStatus is EN_COURS or ANNULE.
+============================================================ */
+export const remove = async (id, user) => {
+  await timeRangeUtility.validateSystemHours(
+    new Date(),
+    "advanced BL deletion",
+  );
+
+  const bl = await prisma.bonLivraison.findUnique({
+    where: { id },
+    select: {
+      id: true,
+      type: true,
+      commandStatus: true,
+      colisTrackingNumber: true,
+      document: {
+        select: {
+          societeId: true,
+          amountPaid: true,
+        },
+      },
+    },
+  });
+
+  if (!bl) throw new ApiError("Advanced bon livraison not found", 404);
+  if (bl.type !== "ADVANCED") {
+    throw new ApiError("This is not an advanced bon livraison", 400);
+  }
+  if (!isSuperAdminUser(user) && bl.document.societeId !== user.societeId) {
+    throw new ApiError("Access denied", 403);
+  }
+  if (!["EN_COURS", "ANNULE"].includes(bl.commandStatus)) {
+    throw new ApiError(
+      `Cannot delete advanced BL with status ${bl.commandStatus}. Only EN_COURS or ANNULE can be deleted.`,
+      400,
+    );
+  }
+
+  if (parseFloat(bl.document.amountPaid) > 0) {
+    throw new ApiError("Cannot delete with associated payments", 400);
+  }
+
+  await prisma.$transaction(
+    async (tx) => {
+      await deleteLinkedStandardBls(tx, id);
+
+      await tx.bonLivraisonPackLine.deleteMany({
+        where: { bonLivraisonId: id },
+      });
+      await tx.clientDocumentLine.deleteMany({ where: { documentId: id } });
+
+      // Delete ALL stock transactions linked to this BL — no orphans remain.
+      await tx.stockTransaction.deleteMany({ where: { bonLivraisonId: id } });
+
+      // Clean up webhook log records linked to this parcel's tracking number
+      if (bl.colisTrackingNumber) {
+        await tx.ameexWebhookLog.deleteMany({
+          where: { trackingCode: bl.colisTrackingNumber },
+        });
+      }
+
+      await tx.bonLivraison.delete({ where: { id } });
+      await tx.clientDocument.delete({ where: { id } });
+    },
+    { timeout: 30000 },
+  );
+
+  return { message: "Advanced bon livraison deleted successfully" };
+};
+
+/* ============================================================
+   GENERATE PDF
+============================================================ */
+const ADVANCED_BL_PDF_CONFIG = {
+  title: "BON DE COMMANDE / LIVRAISON",
+  clientLabel: "DESTINATAIRE / CLIENT",
+  getSubLine: (bl) => {
+    let line = `N°: ${bl.document.documentNumber}  |  Date: ${formatDate(bl.documentDate)}`;
+    if (bl.dateLivraison)
+      line += `  |  Livraison: ${formatDate(bl.dateLivraison)}`;
+    if (bl.heureLivraison) line += ` à ${bl.heureLivraison}`;
+    return line;
+  },
+  getInfoBar: (bl) => {
+    const parts = [];
+    if (bl.depot?.name) {
+      parts.push(
+        `Dépôt: ${bl.depot.name}${bl.depot.code ? ` (${bl.depot.code})` : ""}`,
+      );
+    }
+    if (bl.agence?.name) parts.push(`Agence: ${bl.agence.name}`);
+    const livreurName = bl.delivery?.name || bl.livreur?.name;
+    if (livreurName) parts.push(`Livreur: ${livreurName}`);
+    if (bl.ville) parts.push(`Ville: ${bl.ville}`);
+    if (bl.commandStatus) parts.push(`Statut: ${bl.commandStatus}`);
+    return parts.join("  |  ");
+  },
+  signatureLeft: "Signature du livreur",
+  signatureRight: "Signature du client",
+};
+
+export const generatePDF = async (id, user) => {
+  const bl = await getById(id, user);
+  return generateDocumentPDF(bl, ADVANCED_BL_PDF_CONFIG);
+};
+
+/* ============================================================
+   UNIFIED PICKER — products OR packs
+
+   Query:
+     - products=true  → returns flat product list (variants + articles without variants)
+     - pack=true      → returns packs
+     - search         → filters by name
+     - priceField     → prixVente1 | prixVente2 | prixVente3 (products only)
+     - page, limit    → pagination
+============================================================ */
+export const getProductsOrPacks = async (query, user) => {
+  const {
+    products,
+    pack,
+    search,
+    priceField = "prixVente1",
+    page = 1,
+    limit = 50,
+  } = query;
+
+  const parsedPage = parseInt(page);
+  const parsedLimit = parseInt(limit);
+  const skip = (parsedPage - 1) * parsedLimit;
+
+  // ── PACKS MODE ──────────────────────────────────────────────
+  if (pack) {
+    const where = {
+      active: true,
+      ...(isSuperAdminUser(user) ? {} : { societeId: user.societeId }),
+      ...(search && { name: { contains: search } }),
+    };
+
+    const [total, packs] = await Promise.all([
+      prisma.pack.count({ where }),
+      prisma.pack.findMany({
+        where,
+        select: {
+          id: true,
+          name: true,
+          prixVentePack: true,
+          commission: true,
+          commissionType: true,
+        },
+        orderBy: { name: "asc" },
+        skip,
+        take: parsedLimit,
+      }),
+    ]);
+
+    return {
+      mode: "pack",
+      data: packs.map((p) => ({
+        id: p.id,
+        name: p.name,
+        prixVentePack: parseFloat(p.prixVentePack),
+        commission: parseFloat(p.commission || 0),
+        commissionType: p.commissionType || "VALUE",
+      })),
+      pagination: {
+        total,
+        page: parsedPage,
+        limit: parsedLimit,
+        totalPages: Math.ceil(total / parsedLimit),
+      },
+    };
+  }
+
+  // ── PRODUCTS MODE ───────────────────────────────────────────
+  if (products) {
+    const { depotId } = query;
+
+    if (!depotId) {
+      throw new ApiError("depotId is required for products mode", 400);
+    }
+
+    if (!["prixVente1", "prixVente2", "prixVente3"].includes(priceField)) {
+      throw new ApiError(
+        "priceField must be prixVente1, prixVente2 or prixVente3",
+        400,
+      );
+    }
+
+    const depot = await prisma.depot.findFirst({
+      where: {
+        id: parseInt(depotId),
+        ...(isSuperAdminUser(user) ? {} : { societeId: user.societeId }),
+      },
+      select: { id: true, active: true },
+    });
+    if (!depot) throw new ApiError("Depot not found or access denied", 404);
+    if (!depot.active) throw new ApiError("Cannot use inactive depot", 400);
+
+    const articleWhere = { visible: true };
+    if (search) {
+      articleWhere.OR = [
+        { name: { contains: search } },
+        { variants: { some: { name: { contains: search } } } },
+      ];
+    }
+
+    const parsedDepotId = parseInt(depotId);
+
+    const articles = await prisma.article.findMany({
+      where: articleWhere,
+      select: {
+        id: true,
+        name: true,
+        image: true,
+        prixVente1: true,
+        prixVente2: true,
+        prixVente3: true,
+        commission: true,
+        commissionType: true,
+        stockByDepot: {
+          where: { depotId: parsedDepotId },
+          select: {
+            quantityAvailable: true,
+            quantityReserved: true,
+            quantityInTransit: true,
+          },
+        },
+        variants: {
+          select: {
+            id: true,
+            name: true,
+            stockByDepot: {
+              where: { depotId: parsedDepotId },
+              select: {
+                quantityAvailable: true,
+                quantityReserved: true,
+                quantityInTransit: true,
+              },
+            },
+          },
+        },
+      },
+      orderBy: { name: "asc" },
+    });
+
+    const EMPTY_STOCK = {
+      quantityAvailable: 0,
+      quantityReserved: 0,
+      quantityInTransit: 0,
+    };
+
+    const formatStock = (s) =>
+      s
+        ? {
+            quantityAvailable: parseFloat(s.quantityAvailable),
+            quantityReserved: parseFloat(s.quantityReserved),
+            quantityInTransit: parseFloat(s.quantityInTransit),
+          }
+        : EMPTY_STOCK;
+
+    const data = [];
+    const searchLower = search ? search.toLowerCase() : null;
+
+    for (const article of articles) {
+      const prixVente = parseFloat(article[priceField]);
+      const commission = parseFloat(article.commission || 0);
+      const commissionType = article.commissionType || "VALUE";
+
+      if (article.variants.length === 0) {
+        data.push({
+          id: article.id,
+          articleId: article.id,
+          variantId: null,
+          name: article.name,
+          image: article.image,
+          type: "ARTICLE",
+          prixVente,
+          commission,
+          commissionType,
+          stock: formatStock(article.stockByDepot[0]),
+        });
+      } else {
+        for (const variant of article.variants) {
+          if (searchLower) {
+            const matchesVariant = variant.name
+              ?.toLowerCase()
+              .includes(searchLower);
+            const matchesArticle = article.name
+              .toLowerCase()
+              .includes(searchLower);
+            if (!matchesVariant && !matchesArticle) continue;
+          }
+
+          data.push({
+            id: variant.id,
+            articleId: article.id,
+            variantId: variant.id,
+            name: variant.name || article.name,
+            image: article.image,
+            type: "VARIANT",
+            prixVente,
+            commission,
+            commissionType,
+            stock: formatStock(variant.stockByDepot[0]),
+          });
+        }
+      }
+    }
+
+    const total = data.length;
+    const paged = data.slice(skip, skip + parsedLimit);
+
+    return {
+      mode: "products",
+      priceField,
+      data: paged,
+      pagination: {
+        total,
+        page: parsedPage,
+        limit: parsedLimit,
+        totalPages: Math.ceil(total / parsedLimit),
+      },
+    };
+  }
+
+  throw new ApiError(
+    "Either 'products' or 'pack' query parameter is required",
+    400,
+  );
+};
+
+/* ============================================================
+   UNIFIED LIVREURS PICKER
+
+   Single source of truth: the Delivery model.
+     - INTERN → Delivery.type = INTERN, linked to a User (auth identity)
+     - EXTERN → Delivery.type = EXTERN, standalone
+
+   Query:
+     - type=intern | extern   (required)
+     - search                 (name; email for intern)
+     - active                 (boolean)
+     - page, limit            (pagination)
+
+   Unified response row:
+     { id, userId, name, source, email, tel, address, profile, active }
+============================================================ */
+/* ============================================================
+   FACTURE APPROVERS / APPROVAL WORKFLOW
+============================================================ */
+export const getFactureApprovers = async (user, query = {}) => {
+  const { societeId, search } = query;
+
+  const scopedSocieteId = isSuperAdminUser(user)
+    ? societeId
+      ? parseInt(societeId, 10)
+      : null
+    : user.societeId;
+
+  if (!scopedSocieteId && !isSuperAdminUser(user)) {
+    throw new ApiError("societeId is required", 400);
+  }
+
+  const where = {
+    active: true,
+    hidden: false,
+    AND: [
+      {
+        OR: [
+          { isSuperAdmin: true },
+          { role: { name: { in: SUPER_ADMIN_ROLE_NAMES } } },
+          ...(scopedSocieteId
+            ? [
+                {
+                  role: { name: SOCIETE_ADMIN_ROLE_NAME },
+                  societeId: scopedSocieteId,
+                },
+              ]
+            : [{ role: { name: SOCIETE_ADMIN_ROLE_NAME } }]),
+        ],
+      },
+      ...(search
+        ? [
+            {
+              OR: [
+                { name: { contains: search } },
+                { email: { contains: search } },
+              ],
+            },
+          ]
+        : []),
+    ],
+  };
+
+  return prisma.user.findMany({
+    where,
+    select: {
+      id: true,
+      name: true,
+      email: true,
+      isSuperAdmin: true,
+      societeId: true,
+      role: { select: { name: true } },
+    },
+    orderBy: { name: "asc" },
+  });
+};
+
+const buildFactureLinesFromOrder = (bl) => {
+  const lines = [];
+
+  for (const line of bl.document?.lines || []) {
+    if (!line.articleId && !line.variantId) continue;
+    lines.push({
+      articleId: line.variantId ? undefined : line.articleId || undefined,
+      variantId: line.variantId || undefined,
+      quantity: parseFloat(line.quantity),
+      unitPrice: parseFloat(line.unitPrice),
+      description: line.description || undefined,
+      priceField: line.priceField || "prixVente1",
+    });
+  }
+
+  const packNotes = [];
+  for (const pl of bl.packLines || []) {
+    const packName = pl.pack?.name || "Pack";
+    packNotes.push(`${packName} x${parseFloat(pl.quantity)}`);
+    const first = pl.pack?.components?.[0];
+    if (!first) continue;
+    const articleId = first.articleId || first.article?.id || null;
+    const variantId = first.variantId || first.variant?.id || null;
+    if (!articleId && !variantId) continue;
+    lines.push({
+      articleId: variantId ? undefined : articleId || undefined,
+      variantId: variantId || undefined,
+      quantity: parseFloat(pl.quantity),
+      unitPrice: parseFloat(pl.prixVente),
+      description: packName,
+      priceField: "prixVente1",
+    });
+  }
+
+  return {
+    lines,
+    notes: packNotes.length ? `Packs: ${packNotes.join(", ")}` : undefined,
+  };
+};
+
+const assertCanRespondFactureApproval = (bl, user) => {
+  if (bl.type !== "ADVANCED") {
+    throw new ApiError("This is not an advanced bon livraison", 400);
+  }
+  if (!isSuperAdminUser(user) && bl.document.societeId !== user.societeId) {
+    throw new ApiError("Access denied", 403);
+  }
+  const isDesignated = bl.factureApproverId === user.id;
+  if (!isDesignated && !isAdminLevelUser(user)) {
+    throw new ApiError(
+      "Only the designated approver or an admin can respond",
+      403,
+    );
+  }
+  if (bl.factureApprovalStatus !== "PENDING") {
+    throw new ApiError(
+      `Facture approval is ${bl.factureApprovalStatus}, expected PENDING`,
+      400,
+    );
+  }
+};
+
+export const acceptFactureApproval = async (id, user) => {
+  const bl = await prisma.bonLivraison.findUnique({
+    where: { id },
+    include: {
+      document: {
+        include: {
+          lines: true,
+          client: { select: { id: true, name: true } },
+          user: { select: { id: true, name: true, email: true } },
+        },
+      },
+      preparateur: { select: { id: true, name: true } },
+      packLines: {
+        include: {
+          pack: {
+            select: {
+              id: true,
+              name: true,
+              components: {
+                include: {
+                  article: { select: { id: true, name: true } },
+                  variant: { select: { id: true, name: true } },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+  });
+
+  if (!bl) throw new ApiError("Advanced bon livraison not found", 404);
+  assertCanRespondFactureApproval(bl, user);
+
+  if (!bl.withFacture) {
+    throw new ApiError("Order is not marked withFacture", 400);
+  }
+
+  const existingFacture = await prisma.facture.findFirst({
+    where: { bonLivraisonId: id },
+    select: { id: true },
+  });
+  if (existingFacture) {
+    throw new ApiError("A facture already exists for this order", 409);
+  }
+
+  // Claim PENDING → ACCEPTED first so concurrent accepts cannot double-create.
+  const claimed = await prisma.bonLivraison.updateMany({
+    where: { id, factureApprovalStatus: "PENDING" },
+    data: {
+      factureApprovalStatus: "ACCEPTED",
+      factureApprovedAt: new Date(),
+      factureApprovedById: user.id,
+    },
+  });
+  if (claimed.count === 0) {
+    throw new ApiError(
+      "Facture approval is no longer pending (already processed)",
+      409,
+    );
+  }
+
+  let clientId = bl.document.clientId;
+  let facture = null;
+  try {
+    if (!clientId) {
+      const created = await prisma.client.create({
+        data: {
+          societeId: bl.document.societeId,
+          name:
+            bl.raisonSocial ||
+            bl.document.clientName ||
+            bl.document.client?.name ||
+            "Client facture",
+          phone: bl.telephone || null,
+          address: bl.siegeSocial || bl.localisation || null,
+          ice: bl.ice || null,
+          type: "SOCIETE",
+        },
+        select: { id: true },
+      });
+      clientId = created.id;
+      await prisma.clientDocument.update({
+        where: { id },
+        data: { clientId },
+      });
+    }
+
+    const { lines, notes } = buildFactureLinesFromOrder(bl);
+    if (lines.length === 0) {
+      throw new ApiError(
+        "Cannot create facture: order has no article/variant lines to invoice",
+        400,
+      );
+    }
+
+    facture = await factureSvc.create(
+      {
+        clientId,
+        bonLivraisonId: id,
+        status: "COMPLETED",
+        lines,
+        notes,
+      },
+      user,
+    );
+
+    try {
+      await prisma.$transaction(async (tx) => {
+        const preparateurId = bl.preparateurId || bl.preparateur?.id;
+        if (preparateurId) {
+          await createNotifications(tx, {
+            userIds: [preparateurId],
+            type: "FACTURE_PREPARE",
+            payload: {
+              orderId: id,
+              factureId: facture.id,
+              documentNumber: bl.document.documentNumber ?? null,
+              factureNumber: facture.document?.documentNumber ?? null,
+              clientName:
+                bl.document.client?.name ?? bl.document.clientName ?? null,
+            },
+          });
+        }
+
+        const creatorId = bl.document.createdBy || bl.document.user?.id;
+        if (creatorId && creatorId !== user.id) {
+          await createNotifications(tx, {
+            userIds: [creatorId],
+            type: "FACTURE_APPROVAL_ACCEPTED",
+            payload: {
+              orderId: id,
+              factureId: facture.id,
+              documentNumber: bl.document.documentNumber ?? null,
+              factureNumber: facture.document?.documentNumber ?? null,
+              acceptedByName: user.name || user.email || null,
+              clientName:
+                bl.document.client?.name ?? bl.document.clientName ?? null,
+            },
+          });
+        }
+      });
+    } catch (notifyError) {
+      console.error(
+        "[acceptFactureApproval] notifications failed after facture create:",
+        notifyError?.message || notifyError,
+      );
+    }
+
+    const updated = await prisma.bonLivraison.findUnique({
+      where: { id },
+      include: FULL_ADVANCED_BL_INCLUDE,
+    });
+
+    return { order: updated, facture };
+  } catch (error) {
+    // Only un-claim if the facture was never created (avoid PENDING + orphan FA).
+    if (!facture) {
+      await prisma.bonLivraison.updateMany({
+        where: {
+          id,
+          factureApprovalStatus: "ACCEPTED",
+          factureApprovedById: user.id,
+        },
+        data: {
+          factureApprovalStatus: "PENDING",
+          factureApprovedAt: null,
+          factureApprovedById: null,
+        },
+      });
+    }
+    if (error instanceof ApiError) throw error;
+    throw new ApiError(
+      `Failed to create facture after approval: ${error.message}`,
+      500,
+    );
+  }
+};
+
+export const declineFactureApproval = async (id, user) => {
+  const bl = await prisma.bonLivraison.findUnique({
+    where: { id },
+    include: {
+      document: {
+        select: {
+          societeId: true,
+          documentNumber: true,
+          clientName: true,
+          createdBy: true,
+          client: { select: { name: true } },
+          user: { select: { id: true, name: true } },
+        },
+      },
+    },
+  });
+
+  if (!bl) throw new ApiError("Advanced bon livraison not found", 404);
+  assertCanRespondFactureApproval(bl, user);
+
+  return prisma.$transaction(async (tx) => {
+    await tx.bonLivraison.update({
+      where: { id },
+      data: {
+        factureApprovalStatus: "DECLINED",
+        factureApprovedAt: new Date(),
+        factureApprovedById: user.id,
+      },
+    });
+
+    const creatorId = bl.document.createdBy || bl.document.user?.id;
+    if (creatorId && creatorId !== user.id) {
+      await createNotifications(tx, {
+        userIds: [creatorId],
+        type: "FACTURE_APPROVAL_DECLINED",
+        payload: {
+          orderId: id,
+          documentNumber: bl.document.documentNumber ?? null,
+          declinedByName: user.name || user.email || null,
+          clientName:
+            bl.document.client?.name ?? bl.document.clientName ?? null,
+        },
+      });
+    }
+
+    return tx.bonLivraison.findUnique({
+      where: { id },
+      include: FULL_ADVANCED_BL_INCLUDE,
+    });
+  });
+};
+
+/* ============================================================
+   GET PREPARATEURS
+
+   Returns paginated users having the "Preparateur" role,
+   scoped to the caller's société (super admin sees all).
+============================================================ */
+export const getPreparateurs = async (query, user) => {
+  const { search, active, societeId, page = 1, limit = 50 } = query;
+
+  const parsedPage = parseInt(page);
+  const parsedLimit = parseInt(limit);
+  const skip = (parsedPage - 1) * parsedLimit;
+
+  // SuperAdmin sees all by default; can filter by societeId.
+  // Regular users are always scoped to their own société.
+  // Super Admin users (no societeId) with preparateur capability are always
+  // included so they appear in société-scoped pickers.
+  const scopedSocieteId = isSuperAdminUser(user)
+    ? societeId
+      ? parseInt(societeId)
+      : null
+    : user.societeId;
+
+  const preparateurMatch = {
+    OR: [{ role: { name: "Preparateur" } }, { canBePreparateur: true }],
+  };
+
+  const where = {
+    hidden: false,
+    ...(active !== undefined && {
+      active: active === true || active === "true",
+    }),
+    AND: [
+      preparateurMatch,
+      ...(scopedSocieteId
+        ? [
+            {
+              OR: [
+                { societeId: scopedSocieteId },
+                { isSuperAdmin: true },
+              ],
+            },
+          ]
+        : []),
+      ...(search
+        ? [
+            {
+              OR: [
+                { name: { contains: search } },
+                { email: { contains: search } },
+              ],
+            },
+          ]
+        : []),
+    ],
+  };
+
+  const [total, users] = await Promise.all([
+    prisma.user.count({ where }),
+    prisma.user.findMany({
+      where,
+      select: {
+        id: true,
+        name: true,
+        email: true,
+        profile: true,
+        active: true,
+      },
+      orderBy: { name: "asc" },
+      skip,
+      take: parsedLimit,
+    }),
+  ]);
+
+  return {
+    data: users,
+    pagination: {
+      total,
+      page: parsedPage,
+      limit: parsedLimit,
+      totalPages: Math.ceil(total / parsedLimit),
+    },
+  };
+};
+
+/* ============================================================
+   GET COMMERCIALS
+
+   Returns users having the "Commercial" role (id + name only),
+   scoped to the caller's société (super admin sees all).
+   Super Admins are always included so they can be assigned as
+   commercial on orders for any société.
+============================================================ */
+export const getCommercials = async (user) => {
+  const commercialScope = isSuperAdminUser(user)
+    ? { role: { name: "Commercial" } }
+    : { role: { name: "Commercial" }, societeId: user.societeId };
+
+  return prisma.user.findMany({
+    where: {
+      hidden: false,
+      OR: [
+        commercialScope,
+        { isSuperAdmin: true },
+        { role: { name: { in: ["Super_Admin", "SUPERADMIN"] } } },
+      ],
+    },
+    select: { id: true, name: true },
+    orderBy: { name: "asc" },
+  });
+};
+
+/* ============================================================
+   COMMERCIAL STATS / TOP COMMERCIALS
+
+   Aggregates Advanced BLs by commercial (or the user who launched
+   the order when no commercial is set). Filters on documentDate.
+   Admins see every commercial even with zero orders.
+============================================================ */
+const COMMERCIAL_STATS_STATUSES = new Set([
+  "EN_COURS",
+  "CONFIRME",
+  "PREPARE",
+  "COLLECTE",
+  "EN_ROUTE",
+  "LIVRE",
+  "PAYE",
+  "ANNULE",
+]);
+
+const parseCommandStatuses = (raw) => {
+  const values = Array.isArray(raw)
+    ? raw.flatMap((item) => String(item ?? "").split(","))
+    : String(raw ?? "").split(",");
+  return [
+    ...new Set(
+      values.map((s) => s.trim()).filter((s) => COMMERCIAL_STATS_STATUSES.has(s)),
+    ),
+  ];
+};
+
+const buildCommercialStatsWhere = async (user, query = {}) => {
+  const { dateFrom, dateTo } = query;
+  const where = {
+    type: "ADVANCED",
+    ...(isSuperAdminUser(user) ? {} : { document: { societeId: user.societeId } }),
+  };
+
+  const statuses = parseCommandStatuses(query.commandStatus);
+  if (statuses.length) where.commandStatus = { in: statuses };
+
+  if (dateFrom || dateTo) {
+    const range = {};
+    if (dateFrom) {
+      const from = new Date(dateFrom);
+      if (!Number.isNaN(from.getTime())) {
+        from.setHours(0, 0, 0, 0);
+        range.gte = from;
+      }
+    }
+    if (dateTo) {
+      const to = new Date(dateTo);
+      if (!Number.isNaN(to.getTime())) {
+        to.setHours(23, 59, 59, 999);
+        range.lte = to;
+      }
+    }
+    if (Object.keys(range).length) where.documentDate = range;
+  }
+
+  if (!isAdminLevelUser(user)) {
+    await applyPersonalOrderScope(where, user);
+  }
+
+  return where;
+};
+
+const roundMoney = (n) => parseFloat(Number(n || 0).toFixed(2));
+
+const unitBuyFromLine = (line) =>
+  parseFloat(line.article?.prixAchat ?? line.variant?.article?.prixAchat ?? 0);
+
+const unitBuyFromPack = (pack) => {
+  const purchase = parseFloat(pack?.purchasePrice ?? 0);
+  if (purchase > 0) return purchase;
+  return parseFloat(pack?.coutRevient ?? 0);
+};
+
+const mapOrderFinancials = (bl) => {
+  const sellPrice = roundMoney(
+    parseFloat(bl.document?.amountDue ?? bl.document?.totalTTC ?? 0),
+  );
+  const paid = parseFloat(bl.document?.amountPaid || 0);
+  const commissionApplies = isOrderFullyPaid(
+    sellPrice,
+    paid,
+    bl.commandStatus,
+  );
+
+  const products = [
+    ...(bl.document?.lines || []).map((l) => {
+      const quantity = parseFloat(l.quantity || 0);
+      const unitPrice = parseFloat(l.unitPrice || 0);
+      const unitCommission = commissionApplies
+        ? parseFloat(l.commission || 0)
+        : 0;
+      const unitBuy = unitBuyFromLine(l);
+      const sellTotal = roundMoney(unitPrice * quantity);
+      const buyTotal = roundMoney(unitBuy * quantity);
+      const commissionTotal = roundMoney(unitCommission * quantity);
+      return {
+        kind: l.variant && !l.article ? "variant" : "article",
+        name: l.article?.name || l.variant?.name || l.description || "—",
+        quantity,
+        unitPrice: roundMoney(unitPrice),
+        unitBuy: roundMoney(unitBuy),
+        unitCommission: roundMoney(unitCommission),
+        commission: roundMoney(unitCommission),
+        commissionTotal,
+        sellTotal,
+        buyTotal,
+        total: sellTotal,
+        netProfit: roundMoney(sellTotal - buyTotal - commissionTotal),
+      };
+    }),
+    ...(bl.packLines || []).map((pl) => {
+      const quantity = parseFloat(pl.quantity || 0);
+      const unitPrice = parseFloat(pl.prixVente || 0);
+      const unitCommission = commissionApplies
+        ? parseFloat(pl.commission || 0)
+        : 0;
+      const unitBuy = unitBuyFromPack(pl.pack);
+      const sellTotal = roundMoney(unitPrice * quantity);
+      const buyTotal = roundMoney(unitBuy * quantity);
+      const commissionTotal = roundMoney(unitCommission * quantity);
+      return {
+        kind: "pack",
+        name: pl.pack?.name ?? "—",
+        quantity,
+        unitPrice: roundMoney(unitPrice),
+        unitBuy: roundMoney(unitBuy),
+        unitCommission: roundMoney(unitCommission),
+        commission: roundMoney(unitCommission),
+        commissionTotal,
+        sellTotal,
+        buyTotal,
+        total: sellTotal,
+        netProfit: roundMoney(sellTotal - buyTotal - commissionTotal),
+      };
+    }),
+  ];
+
+  const boughtPrice = roundMoney(products.reduce((sum, p) => sum + p.buyTotal, 0));
+  const totalCommission = commissionApplies
+    ? roundMoney(parseFloat(bl.totalCommission || 0))
+    : 0;
+
+  return {
+    products,
+    boughtPrice,
+    sellPrice,
+    totalCommission,
+    netProfit: roundMoney(sellPrice - boughtPrice - totalCommission),
+  };
+};
+
+const emptyOwnerStats = (id, name, roleName) => ({
+  id,
+  name: name || "—",
+  roleName: roleName || null,
+  orderCount: 0,
+  totalCommission: 0,
+  totalCA: 0,
+  totalPaid: 0,
+  totalBought: 0,
+  totalNetProfit: 0,
+  orders: [],
+});
+
+export const getCommercialStats = async (user, query = {}) => {
+  const where = await buildCommercialStatsWhere(user, query);
+  const parsedOwnerId = parseInt(query.commercialId, 10);
+  const filterOwnerId = Number.isFinite(parsedOwnerId) ? parsedOwnerId : null;
+
+  const [rows, allCommercials] = await Promise.all([
+    prisma.bonLivraison.findMany({
+      where,
+      select: {
+        id: true,
+        commercialId: true,
+        totalCommission: true,
+        commandStatus: true,
+        dateLivraison: true,
+        createdAt: true,
+        commercial: {
+          select: { id: true, name: true, role: { select: { name: true } } },
+        },
+        packLines: {
+          select: {
+            quantity: true,
+            prixVente: true,
+            commission: true,
+            pack: {
+              select: {
+                id: true,
+                name: true,
+                purchasePrice: true,
+                coutRevient: true,
+              },
+            },
+          },
+        },
+        document: {
+          select: {
+            createdBy: true,
+            documentNumber: true,
+            clientName: true,
+            amountDue: true,
+            amountPaid: true,
+            totalTTC: true,
+            createdAt: true,
+            user: {
+              select: { id: true, name: true, role: { select: { name: true } } },
+            },
+            lines: {
+              select: {
+                description: true,
+                quantity: true,
+                unitPrice: true,
+                commission: true,
+                totalTTC: true,
+                article: { select: { id: true, name: true, prixAchat: true } },
+                variant: {
+                  select: {
+                    id: true,
+                    name: true,
+                    article: { select: { name: true, prixAchat: true } },
+                  },
+                },
+              },
+              orderBy: { lineNumber: "asc" },
+            },
+          },
+        },
+      },
+      orderBy: { createdAt: "desc" },
+    }),
+    isAdminLevelUser(user)
+      ? prisma.user.findMany({
+          where: {
+            hidden: false,
+            OR: [
+              isSuperAdminUser(user)
+                ? { role: { name: "Commercial" } }
+                : {
+                    role: { name: "Commercial" },
+                    societeId: user.societeId,
+                  },
+              { isSuperAdmin: true },
+              { role: { name: { in: ["Super_Admin", "SUPERADMIN"] } } },
+            ],
+          },
+          select: { id: true, name: true, role: { select: { name: true } } },
+          orderBy: { name: "asc" },
+        })
+      : Promise.resolve([]),
+  ]);
+
+  const byOwner = new Map();
+  for (const c of allCommercials) {
+    byOwner.set(
+      c.id,
+      emptyOwnerStats(c.id, c.name, c.role?.name || "Commercial"),
+    );
+  }
+
+  for (const bl of rows) {
+    const ownerId = bl.commercialId || bl.document?.createdBy;
+    if (!ownerId) continue;
+
+    const ownerName = bl.commercialId
+      ? bl.commercial?.name
+      : bl.document?.user?.name;
+    const roleName = bl.commercialId
+      ? bl.commercial?.role?.name || "Commercial"
+      : bl.document?.user?.role?.name || null;
+
+    if (!byOwner.has(ownerId)) {
+      byOwner.set(ownerId, emptyOwnerStats(ownerId, ownerName, roleName));
+    }
+
+    const entry = byOwner.get(ownerId);
+    if (!entry.name || entry.name === "—") entry.name = ownerName || "—";
+    if (!entry.roleName) entry.roleName = roleName;
+
+    const finances = mapOrderFinancials(bl);
+    const paid = parseFloat(bl.document?.amountPaid || 0);
+    const storedCommission = roundMoney(parseFloat(bl.totalCommission || 0));
+    const netProfit = roundMoney(
+      finances.sellPrice - finances.boughtPrice - storedCommission,
+    );
+
+    entry.orderCount += 1;
+    entry.totalCommission += storedCommission;
+    entry.totalCA += finances.sellPrice;
+    entry.totalPaid += paid;
+    entry.totalBought += finances.boughtPrice;
+    entry.totalNetProfit += netProfit;
+    entry.orders.push({
+      id: bl.id,
+      documentNumber: bl.document?.documentNumber ?? null,
+      clientName: bl.document?.clientName ?? null,
+      commandStatus: bl.commandStatus,
+      dateLivraison: bl.dateLivraison,
+      createdAt: bl.createdAt ?? bl.document?.createdAt ?? null,
+      amountDue: finances.sellPrice,
+      amountPaid: paid,
+      boughtPrice: finances.boughtPrice,
+      totalCommission: storedCommission,
+      netProfit,
+      createdByName: bl.document?.user?.name ?? null,
+      products: finances.products,
+    });
+  }
+
+  for (const entry of byOwner.values()) {
+    entry.orders.sort(
+      (a, b) =>
+        new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime(),
+    );
+  }
+
+  const allOwners = Array.from(byOwner.values())
+    .map((c) => ({
+      ...c,
+      totalCommission: parseFloat(c.totalCommission.toFixed(2)),
+      totalCA: parseFloat(c.totalCA.toFixed(2)),
+      totalPaid: parseFloat(c.totalPaid.toFixed(2)),
+      totalBought: parseFloat(c.totalBought.toFixed(2)),
+      totalNetProfit: parseFloat(c.totalNetProfit.toFixed(2)),
+    }))
+    .sort(
+      (a, b) =>
+        b.totalCommission - a.totalCommission ||
+        b.orderCount - a.orderCount ||
+        String(a.name).localeCompare(String(b.name)),
+    );
+
+  const filterOptions = allOwners.map(({ id, name, roleName }) => ({
+    id,
+    name,
+    roleName,
+  }));
+
+  let commercials = allOwners;
+  if (filterOwnerId) {
+    commercials = allOwners.filter((c) => c.id === filterOwnerId);
+    if (commercials.length === 0) {
+      const known = allCommercials.find((c) => c.id === filterOwnerId);
+      commercials = [
+        emptyOwnerStats(
+          filterOwnerId,
+          known?.name,
+          known?.role?.name || "Commercial",
+        ),
+      ];
+    }
+  }
+
+  if (parseCommandStatuses(query.commandStatus).length && !filterOwnerId) {
+    commercials = commercials.filter((c) => c.orderCount > 0);
+  }
+
+  const totals = commercials.reduce(
+    (acc, c) => {
+      acc.orderCount += c.orderCount;
+      acc.totalCommission += c.totalCommission;
+      acc.totalCA += c.totalCA;
+      acc.totalPaid += c.totalPaid;
+      acc.totalBought += c.totalBought;
+      acc.totalNetProfit += c.totalNetProfit;
+      return acc;
+    },
+    {
+      orderCount: 0,
+      totalCommission: 0,
+      totalCA: 0,
+      totalPaid: 0,
+      totalBought: 0,
+      totalNetProfit: 0,
+    },
+  );
+
+  return {
+    summary: {
+      orderCount: totals.orderCount,
+      totalCommission: parseFloat(totals.totalCommission.toFixed(2)),
+      totalCA: parseFloat(totals.totalCA.toFixed(2)),
+      totalPaid: parseFloat(totals.totalPaid.toFixed(2)),
+      totalBought: parseFloat(totals.totalBought.toFixed(2)),
+      totalNetProfit: parseFloat(totals.totalNetProfit.toFixed(2)),
+      commercialCount: commercials.length,
+    },
+    commercials,
+    filterOptions,
+  };
+};
+
+export const getTopCommercials = async (user, query = {}) => {
+  const limit = Math.min(Math.max(parseInt(query.limit || 5), 1), 20);
+  const stats = await getCommercialStats(user, {
+    dateFrom: query.dateFrom,
+    dateTo: query.dateTo,
+  });
+  return {
+    summary: stats.summary,
+    commercials: stats.commercials
+      .filter((c) => c.orderCount > 0)
+      .slice(0, limit)
+      .map(({ orders, ...rest }) => rest),
+  };
+};
+
+/* ============================================================
+   GET BLs BY STATUS
+
+   Paginated list driven by a status filter (the same buckets
+   the workflow-counts cards expose). Role-based scoping mirrors
+   getWorkflowCounts so dashboard counters and detail views agree.
+
+   Query: { status, livreurId?, page?, limit? }
+   - status   : one of CONFIRME, PREPARE, COLLECTE, EN_ROUTE, LIVRE, PAYE
+   - livreurId: optional; ignored for Livreur (forced to own Delivery.id)
+============================================================ */
+const STATUS_BY_ROLE = {
+  Livreur: new Set(LIVREUR_STATUSES),
+  Preparateur: new Set(PREPARATEUR_FILTERABLE_STATUSES),
+};
+const VISIBLE_STATUSES = new Set([
+  "CONFIRME",
+  "PREPARE",
+  "COLLECTE",
+  "EN_ROUTE",
+  "LIVRE",
+  "PAYE",
+]);
+
+export const getBLsByStatus = async (query, user) => {
+  const { status, livreurId, page = 1, limit = 20 } = query;
+
+  if (!status) throw new ApiError("status is required", 400);
+  if (!VISIBLE_STATUSES.has(status)) {
+    throw new ApiError(
+      `status must be one of: ${[...VISIBLE_STATUSES].join(", ")}`,
+      400,
+    );
+  }
+
+  // Role-based status gate
+  if (!isSuperAdminUser(user)) {
+    const allowedForRole = STATUS_BY_ROLE[user.roleName];
+    if (allowedForRole && !allowedForRole.has(status)) {
+      throw new ApiError(
+        `Role ${user.roleName} cannot view BLs in status ${status}`,
+        403,
+      );
+    }
+  }
+
+  // Role-based row scoping
+  const where = {
+    type: "ADVANCED",
+    commandStatus: status,
+    ...(isSuperAdminUser(user) ? {} : { document: { societeId: user.societeId } }),
+  };
+
+  if (!isAdminLevelUser(user)) {
+    await applyPersonalOrderScope(where, user);
+  }
+  if (livreurId && user.roleName !== "Livreur") {
+    where.livreurId = parseInt(livreurId);
+  }
+
+  const parsedPage = parseInt(page);
+  const parsedLimit = parseInt(limit);
+
+  const [total, rows] = await Promise.all([
+    prisma.bonLivraison.count({ where }),
+    prisma.bonLivraison.findMany({
+      where,
+      select: {
+        id: true,
+        documentDate: true,
+        dateLivraison: true,
+        ville: true,
+        telephone: true,
+        whatsapp: true,
+        isReported: true,
+        nextDeliveryDate: true,
+        commandStatus: true,
+        modeReglement: true,
+        banqueId: true,
+        document: {
+          select: {
+            documentNumber: true,
+            clientName: true,
+            amountDue: true,
+            amountPaid: true,
+            user: { select: { id: true, name: true } },
+            lines: {
+              select: {
+                id: true,
+                lineNumber: true,
+                description: true,
+                quantity: true,
+                unitPrice: true,
+                totalTTC: true,
+                article: { select: { id: true, name: true } },
+                variant: { select: { id: true, name: true } },
+              },
+              orderBy: { lineNumber: "asc" },
+            },
+          },
+        },
+        livreur: { select: { id: true, name: true } },
+        packLines: {
+          select: {
+            id: true,
+            quantity: true,
+            prixVente: true,
+            pack: { select: { id: true, name: true } },
+          },
+        },
+      },
+      orderBy: { createdAt: "desc" },
+      skip: (parsedPage - 1) * parsedLimit,
+      take: parsedLimit,
+    }),
+  ]);
+
+  const fmt = (d) => {
+    if (!d) return null;
+    const date = new Date(d);
+    const dd = String(date.getDate()).padStart(2, "0");
+    const mm = String(date.getMonth() + 1).padStart(2, "0");
+    const yyyy = date.getFullYear();
+    return `${dd}/${mm}/${yyyy}`;
+  };
+
+  const data = rows.map((bl) => {
+    const products = [
+      ...bl.document.lines.map((l) => ({
+        kind: "article",
+        name: l.article?.name || l.variant?.name || l.description || "—",
+        quantity: parseFloat(l.quantity),
+        unitPrice: parseFloat(l.unitPrice),
+        total: parseFloat(l.totalTTC),
+      })),
+      ...bl.packLines.map((pl) => ({
+        kind: "pack",
+        name: pl.pack?.name ?? "—",
+        quantity: parseFloat(pl.quantity),
+        unitPrice: parseFloat(pl.prixVente),
+        total: parseFloat(
+          (parseFloat(pl.prixVente) * parseFloat(pl.quantity)).toFixed(2),
+        ),
+      })),
+    ];
+
+    return {
+      id: bl.id,
+      documentNumber: bl.document?.documentNumber ?? null,
+      createdBy: bl.document?.user?.name ?? null,
+      livreurName: bl.livreur?.name ?? null,
+      documentDate: fmt(bl.documentDate),
+      dateLivraison: fmt(bl.dateLivraison),
+      clientName: bl.document?.clientName ?? null,
+      telephone: bl.telephone,
+      whatsapp: bl.whatsapp,
+      ville: bl.ville,
+      isReported: bl.isReported,
+      nextDeliveryDate: fmt(bl.nextDeliveryDate),
+      amountPaid: parseFloat(bl.document?.amountPaid || 0),
+      amountDue: parseFloat(bl.document?.amountDue || 0),
+      currentStatus: bl.commandStatus,
+      modeReglement: bl.modeReglement ?? null,
+      banqueId: bl.banqueId ?? null,
+      products,
+    };
+  });
+
+  return {
+    pagination: {
+      total,
+      page: parsedPage,
+      limit: parsedLimit,
+      totalPages: Math.ceil(total / parsedLimit),
+    },
+    data,
+  };
+};
+
+/* ============================================================
+   GET WORKFLOW COUNTS
+
+   Returns role-aware counters of Advanced BLs grouped by their
+   current status. The counters represent the *next actionable
+   step* — the calculation is on the current commandStatus, but
+   labels reflect what the user has to do next.
+
+   Role visibility:
+     - Super_Admin → pipeline counters plus Livré and Payé, for every user's orders
+     - Societe_Admin
+         → 5 counters: aPreparer, aCollecter, enRoute, aLivrer, aPayer (société)
+     - Commercial / Gerant / Caissier / other non-admins
+         → 5 counters on their own orders
+     - Livreur     → only aCollecter, enRoute, aLivrer, aPayer (own BLs)
+     - Preparateur → only aPreparer = CONFIRME (own BLs, ready to prepare)
+============================================================ */
+export const getWorkflowCounts = async (user, query = {}) => {
+  const { dateFrom, dateTo } = query;
+
+  const where = {
+    type: "ADVANCED",
+    ...(isSuperAdminUser(user) ? {} : { document: { societeId: user.societeId } }),
+  };
+
+  // Optional period filter on order document date (not delivery date)
+  if (dateFrom || dateTo) {
+    const range = {};
+    if (dateFrom) {
+      const from = new Date(dateFrom);
+      if (!Number.isNaN(from.getTime())) {
+        from.setHours(0, 0, 0, 0);
+        range.gte = from;
+      }
+    }
+    if (dateTo) {
+      const to = new Date(dateTo);
+      if (!Number.isNaN(to.getTime())) {
+        to.setHours(23, 59, 59, 999);
+        range.lte = to;
+      }
+    }
+    if (Object.keys(range).length) {
+      where.documentDate = range;
+    }
+  }
+
+  if (!isAdminLevelUser(user)) {
+    await applyPersonalOrderScope(where, user);
+  }
+
+  // findMany (not groupBy) so relation filters (société, commercial, …) work.
+  const rows = await prisma.bonLivraison.findMany({
+    where,
+    select: { commandStatus: true },
+  });
+
+  const byStatus = {};
+  for (const row of rows) {
+    if (!row.commandStatus) continue;
+    byStatus[row.commandStatus] = (byStatus[row.commandStatus] || 0) + 1;
+  }
+
+  // Counter map: current status → next-step label
+  const allCounts = {
+    aPreparer: byStatus.CONFIRME ?? 0,
+    aCollecter: byStatus.PREPARE ?? 0,
+    enRoute: byStatus.COLLECTE ?? 0,
+    aLivrer: byStatus.EN_ROUTE ?? 0,
+    aPayer: byStatus.LIVRE ?? 0,
+  };
+
+  const total = Object.values(byStatus).reduce((s, n) => s + n, 0);
+
+  if (getRoleName(user) === "livreur") {
+    const livreurCounts = {
+      aCollecter: allCounts.aCollecter,
+      enRoute: allCounts.enRoute,
+      aLivrer: allCounts.aLivrer,
+      aPayer: allCounts.aPayer,
+    };
+    return {
+      ...livreurCounts,
+      total: Object.values(livreurCounts).reduce((s, n) => s + n, 0),
+    };
+  }
+  if (getRoleName(user) === "preparateur") {
+    return { aPreparer: allCounts.aPreparer, total: allCounts.aPreparer };
+  }
+  if (isSuperAdminUser(user)) {
+    return {
+      ...allCounts,
+      livre: byStatus.LIVRE ?? 0,
+      paye: byStatus.PAYE ?? 0,
+      total,
+    };
+  }
+  return { ...allCounts, total };
+};
+
+/* ============================================================
+   GET PLANNING
+
+   Operational planning view: groups Advanced BLs by day across
+   a date interval and aggregates per-livreur metrics.
+
+   Query: { livreurId?, startDate, endDate }
+   Date filter is on `documentDate`. Days within the interval that
+   have no BLs are still returned with an empty array, so the
+   frontend can render a continuous calendar.
+============================================================ */
+export const getPlanning = async (query, user) => {
+  const { livreurId, startDate, endDate } = query;
+
+  if (!startDate || !endDate) {
+    throw new ApiError("startDate and endDate are required", 400);
+  }
+
+  const start = new Date(startDate);
+  const end = new Date(endDate);
+
+  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) {
+    throw new ApiError("startDate and endDate must be valid ISO dates", 400);
+  }
+  if (start > end) {
+    throw new ApiError("startDate must be <= endDate", 400);
+  }
+
+  // Normalize boundaries to full-day inclusive
+  start.setHours(0, 0, 0, 0);
+
+  end.setHours(23, 59, 59, 999);
+
+  const where = {
+    type: "ADVANCED",
+    dateLivraison: { gte: start, lte: end },
+    ...(livreurId && { livreurId: parseInt(livreurId) }),
+    document: isSuperAdminUser(user) ? undefined : { societeId: user.societeId },
+  };
+
+  // Role scoping — Super Admin sees every user's orders
+  if (!isAdminLevelUser(user)) {
+    await applyPersonalOrderScope(where, user);
+  }
+
+  const rows = await prisma.bonLivraison.findMany({
+    where,
+    select: {
+      id: true,
+      documentDate: true,
+      dateLivraison: true,
+      heureLivraison: true,
+      ville: true,
+      localisation: true,
+      whatsapp: true,
+      telephone: true,
+      nombreDeColis: true,
+      commandStatus: true,
+      isReported: true,
+      isSuspended: true,
+      livreurId: true,
+      preparateurId: true,
+      observation: true,
+      modeReglement: true,
+      document: {
+        select: {
+          user: { select: { name: true } },
+          documentNumber: true,
+          clientName: true,
+          amountDue: true,
+          amountPaid: true,
+        },
+      },
+      agence: { select: { id: true, name: true } },
+      livreur: { select: { id: true, name: true, tel: true } },
+      preparateur: { select: { id: true, name: true } },
+    },
+    orderBy: [{ documentDate: "asc" }, { createdAt: "asc" }],
+  });
+
+  const fmt = (d) => {
+    const dd = String(d.getDate()).padStart(2, "0");
+    const mm = String(d.getMonth() + 1).padStart(2, "0");
+    const yyyy = d.getFullYear();
+    return `${dd}/${mm}/${yyyy}`;
+  };
+
+  // Bucket BLs by their normalized documentDate key (dd/mm/yyyy).
+  const blsByDate = new Map();
+  let totalColis = 0;
+  let totalMontant = 0;
+
+  for (const bl of rows) {
+    const key = fmt(new Date(bl.dateLivraison));
+    if (!blsByDate.has(key)) blsByDate.set(key, []);
+
+    const amountDue = parseFloat(bl.document?.amountDue || 0);
+    const amountPaid = parseFloat(bl.document?.amountPaid || 0);
+    const reste = parseFloat((amountDue - amountPaid).toFixed(2));
+
+    blsByDate.get(key).push({
+      id: bl.id,
+      documentNumber: bl.document?.documentNumber ?? null,
+      clientName: bl.document?.clientName ?? null,
+      createdBy: bl.document.user.name,
+      ville: bl.ville,
+      localisation: bl.localisation,
+      telephone: bl.telephone,
+      whatsapp: bl.whatsapp,
+      observation: bl.observation,
+      dateLivraison: bl.dateLivraison ? fmt(new Date(bl.dateLivraison)) : null,
+      heureLivraison: bl.heureLivraison,
+      nombreDeColis: bl.nombreDeColis ?? 0,
+      commandStatus: bl.commandStatus,
+      modeReglement: bl.modeReglement,
+      isReported: bl.isReported,
+      isSuspended: bl.isSuspended,
+      agenceName: bl.agence?.name ?? null,
+      livreurId: bl.livreurId,
+      livreurName: bl.livreur?.name ?? null,
+      livreurPhone: bl.livreur?.tel ?? null,
+      preparateurId: bl.preparateurId,
+      preparateurName: bl.preparateur?.name ?? null,
+      amountDue,
+      amountPaid,
+      reste,
+    });
+
+    totalColis += bl.nombreDeColis ?? 0;
+    totalMontant += reste;
+  }
+
+  // Walk every day in the interval so empty days are included.
+  const groupedByDate = [];
+  const cursor = new Date(start);
+  cursor.setHours(0, 0, 0, 0);
+  const endDay = new Date(end);
+  endDay.setHours(0, 0, 0, 0);
+
+  while (cursor <= endDay) {
+    const key = fmt(cursor);
+    groupedByDate.push({
+      date: key,
+      advancedBonLivraisons: blsByDate.get(key) ?? [],
+    });
+    cursor.setDate(cursor.getDate() + 1);
+  }
+
+  const totalDays = groupedByDate.filter(
+    (g) => g.advancedBonLivraisons.length > 0,
+  ).length;
+
+  return {
+    groupedByDate,
+    metrics: {
+      totalAdvancedBonLivraisons: rows.length,
+      totalColis,
+      totalMontantAdvancedBonLivraisons: parseFloat(totalMontant.toFixed(2)),
+      totalDays,
+    },
+  };
+};
+
+export const getLivreurs = async (query, user) => {
+  const { type, search, active, societeId, page = 1, limit = 50 } = query;
+
+  if (!["intern", "extern"].includes(type)) {
+    throw new ApiError("type must be either 'intern' or 'extern'", 400);
+  }
+
+  const parsedPage = parseInt(page);
+  const parsedLimit = parseInt(limit);
+  const skip = (parsedPage - 1) * parsedLimit;
+
+  // SuperAdmin sees all by default; can filter by societeId.
+  // Regular users are always scoped to their own société.
+  // Super Admin livreurs (canBeLivreur) appear in every société picker.
+  const scopedSocieteId = isSuperAdminUser(user)
+    ? societeId
+      ? parseInt(societeId)
+      : null
+    : user.societeId;
+  const activeFilter =
+    active === undefined
+      ? {}
+      : { active: active === true || active === "true" };
+
+  const deliveryType = type === "intern" ? "INTERN" : "EXTERN";
+
+  const where = {
+    ...activeFilter,
+    type: deliveryType,
+    AND: [
+      ...(scopedSocieteId
+        ? [
+            {
+              OR: [
+                { societeId: scopedSocieteId },
+                ...(type === "intern"
+                  ? [{ user: { isSuperAdmin: true, canBeLivreur: true } }]
+                  : []),
+              ],
+            },
+          ]
+        : []),
+      ...(type === "intern"
+        ? [
+            {
+              OR: [
+                { user: { role: { name: "Livreur" } } },
+                { user: { canBeLivreur: true } },
+              ],
+            },
+          ]
+        : []),
+      ...(search
+        ? [
+            {
+              OR: [
+                { name: { contains: search } },
+                ...(type === "intern"
+                  ? [{ user: { email: { contains: search } } }]
+                  : []),
+              ],
+            },
+          ]
+        : []),
+    ],
+  };
+
+  const [total, deliveries] = await Promise.all([
+    prisma.delivery.count({ where }),
+    prisma.delivery.findMany({
+      where,
+      select: {
+        id: true,
+        userId: true,
+        name: true,
+        type: true,
+        entityType: true,
+        address: true,
+        tel: true,
+        active: true,
+        user:
+          type === "intern"
+            ? {
+                select: {
+                  id: true,
+                  email: true,
+                  profile: true,
+                  active: true,
+                },
+              }
+            : false,
+      },
+      orderBy: { name: "asc" },
+      skip,
+      take: parsedLimit,
+    }),
+  ]);
+
+  return {
+    type,
+    data: deliveries.map((d) => ({
+      id: d.id,
+      userId: d.userId,
+      name: d.name,
+      source: d.type,
+      email: d.user?.email ?? null,
+      tel: d.tel,
+      address: d.address,
+      profile: d.user?.profile ?? null,
+      entityType: d.entityType,
+      active: d.active,
+    })),
+    pagination: {
+      total,
+      page: parsedPage,
+      limit: parsedLimit,
+      totalPages: Math.ceil(total / parsedLimit),
+    },
+  };
+};

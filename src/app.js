@@ -1,0 +1,78 @@
+import express from "express";
+import loaders from "./loaders/index.js";
+import cors from "cors";
+import path from "path";
+
+const app = express();
+
+const allowedOrigins = [
+  "http://localhost:5173",
+  "http://localhost:4173",
+  "http://localhost:8002",
+  "http://localhost:8003",
+  "http://192.168.1.143:8002",
+  "http://192.168.1.143:8003",
+];
+
+const LAN_HOST =
+  /^(localhost|127\.0\.0\.1|10(?:\.\d{1,3}){3}|192\.168(?:\.\d{1,3}){2}|172\.(?:1[6-9]|2\d|3[0-1])(?:\.\d{1,3}){2})$/;
+
+const LAN_PORTS = new Set([
+  "",
+  "80",
+  "443",
+  "3000",
+  "4173",
+  "5173",
+  "5174",
+  "8002",
+  "8003",
+]);
+
+const isAllowedOrigin = (origin) => {
+  if (!origin || origin === "null" || origin === "file://") return true;
+  if (allowedOrigins.includes(origin)) return true;
+
+  try {
+    const url = new URL(origin);
+
+    if (url.protocol !== "http:" && url.protocol !== "https:") {
+      return false;
+    }
+
+    return LAN_HOST.test(url.hostname) && LAN_PORTS.has(url.port);
+  } catch {
+    return false;
+  }
+};
+
+app.use(
+  cors({
+    origin: (origin, callback) => {
+      if (isAllowedOrigin(origin)) {
+        callback(null, true);
+      } else {
+        callback(new Error("Not allowed by CORS"));
+      }
+    },
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+    credentials: true,
+  }),
+);
+
+app.use("/uploads", express.static(path.join(process.cwd(), "uploads")));
+
+await loaders({ app });
+
+// Serve React build
+const frontendPath = path.join(process.cwd(), "client");
+
+app.use(express.static(frontendPath));
+
+// React Router fallback
+app.get("/{*splat}", (req, res) => {
+  res.sendFile(path.join(frontendPath, "index.html"));
+});
+
+export default app;
